@@ -39,7 +39,7 @@
 #include <mpi.h>
 #endif
 
-#include "hoomd/extern/kiss_fft/tools/kiss_fftnd.h"
+#include "hoomd/extern/kiss_fftnd.h"
 
 #include <pybind11/pybind11.h>
 
