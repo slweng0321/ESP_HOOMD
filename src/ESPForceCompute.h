@@ -34,7 +34,7 @@
 #include "hoomd/ParticleGroup.h"
 
 #ifdef ENABLE_MPI
-#include "hoomd/CommunicatorGrid.h"
+#include "hoomd/Communicator.h"
 #include "hoomd/extern/dfftlib/src/dfft_host.h"
 #include <mpi.h>
 #endif
