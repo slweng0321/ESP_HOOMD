@@ -1,9 +1,9 @@
-// Copyright (c) 2025 Shih-Lun Weng.
-// Part of RxMC, released under the BSD 3-Clause License.
-
-/*! \file ESPForceComputeGPU.h
-    \brief Declares the GPU-accelerated ESPForceCompute class
-*/
+// Copyright (c) 2024-2026 ESP Plugin Contributors.
+// Released under the BSD 3-Clause License.
+//
+// ESPForceComputeGPU.h
+//
+// GPU override for the ESPForceCompute mesh pipeline.
 
 #pragma once
 
@@ -11,50 +11,94 @@
 #error This header cannot be compiled by nvcc
 #endif
 
-#include "HelpFunctions/ESPForceCompute.h"
-#include "hoomd/md/PPPMForceComputeGPU.h"
+#include "ESPForceCompute.h"
+#include "hoomd/Autotuner.h"
 
 namespace hoomd
     {
 namespace md
     {
-/*! \ingroup updaters
-    \brief GPU-accelerated custom PPPM force compute
-    
-    This class provides GPU acceleration for ESPForceCompute,
-    leveraging HIP for NVIDIA and AMD GPUs while maintaining correctness
-    during reactive Monte Carlo simulations.
-*/
-class PYBIND11_EXPORT ESPForceComputeGPU : public PPPMForceComputeGPU
+/*! \brief GPU-accelerated ESP force compute.
+ */
+class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
     {
     public:
-    //! Constructor
-    /*! \param sysdef System definition
-        \param nlist Neighbor list for PPPM calculations
-        \param group Particle group to apply force to
-    */
+    /*! \brief Construct a GPU ESP force compute.
+     */
     ESPForceComputeGPU(std::shared_ptr<SystemDefinition> sysdef,
-                              std::shared_ptr<NeighborList> nlist,
-                              std::shared_ptr<ParticleGroup> group);
+                       std::shared_ptr<NeighborList> nlist,
+                       std::shared_ptr<ParticleGroup> group);
 
-    //! GPU-accelerated force computation
-    /*! \param timestep Current simulation timestep
-    */
-    void computeForces(uint64_t timestep) override;
+    ~ESPForceComputeGPU() override;
 
     protected:
-    //! GPU implementation of charge-dependent state refresh
-    void refreshChargeDependentState();
+    /*! \brief Setup FFT plans and allocate GPU mesh arrays. */
+    void initializeFFT() override;
 
-    //! GPU implementation of ghost cell computation
-    uint3 computeGhostCellNumCustom() const;
+    /*! \brief Assign particle charges to the GPU mesh. */
+    void assignParticles() override;
+
+    /*! \brief Update the reciprocal mesh on GPU. */
+    void updateMeshes() override;
+
+    /*! \brief Interpolate forces from the inverse mesh. */
+    void interpolateForces() override;
+
+    /*! \brief Compute the influence function on GPU. */
+    void computeInfluenceFunction() override;
+
+    /*! \brief Compute reciprocal-space potential energy. */
+    Scalar computePE() override;
+
+    /*! \brief Correct excluded-pair forces on GPU. */
+    void fixExclusions() override;
+
+    inline void handleHIPFFTResult(hipfftResult result,
+                                   const char* file,
+                                   unsigned int line) const
+        {
+        if (result != HIPFFT_SUCCESS)
+            {
+            std::ostringstream oss;
+            oss << "HIPFFT returned error " << result << " in file " << file
+                << " line " << line << std::endl;
+            throw std::runtime_error(oss.str());
+            }
+        }
+
+    private:
+    std::shared_ptr<Autotuner<1>> m_tuner_assign;
+    std::shared_ptr<Autotuner<1>> m_tuner_update;
+    std::shared_ptr<Autotuner<1>> m_tuner_force;
+    std::shared_ptr<Autotuner<1>> m_tuner_influence;
+
+    hipfftHandle m_hipfft_plan;
+    bool m_local_fft;
+    bool m_cufft_initialized;
+    bool m_cuda_dfft_initialized;
+
+#ifdef ENABLE_MPI
+    using CommunicatorGridGPUComplex = CommunicatorGridGPU<hipfftComplex>;
+    std::shared_ptr<CommunicatorGridGPUComplex> m_gpu_grid_comm_forward;
+    std::shared_ptr<CommunicatorGridGPUComplex> m_gpu_grid_comm_reverse;
+    dfft_plan m_dfft_plan_forward;
+    dfft_plan m_dfft_plan_inverse;
+#endif
+
+    GPUArray<hipfftComplex> m_mesh;
+    GPUArray<hipfftComplex> m_mesh_scratch;
+    GPUArray<hipfftComplex> m_inv_fourier_mesh_x;
+    GPUArray<hipfftComplex> m_inv_fourier_mesh_y;
+    GPUArray<hipfftComplex> m_inv_fourier_mesh_z;
+
+    GPUFlags<Scalar> m_sum;
+    GPUArray<Scalar> m_sum_partial;
+    GPUArray<Scalar> m_sum_virial_partial;
+    GPUArray<Scalar> m_sum_virial;
+    unsigned int m_block_size;
     };
-
-namespace detail
-    {
-//! Python export function
-void export_ESPForceComputeGPU(pybind11::module& m);
-    } // namespace detail
 
     } // namespace md
     } // namespace hoomd
+
+#endif // ENABLE_HIP
