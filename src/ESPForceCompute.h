@@ -11,13 +11,12 @@
 #include "hoomd/ForceCompute.h"
 #include "hoomd/GPUArray.h"
 #include "hoomd/Index1D.h"
-#include "hoomd/MeshDefinition.h"
 #include "hoomd/ParticleGroup.h"
-#include "hoomd/md/PPPMForceCompute.h"
+#include "hoomd/md/NeighborList.h" // Updated path
+#include "hoomd/GPUFlags.h" // Added for GPUFlags
+#include "hoomd/md/CommunicatorGrid.h" // Corrected for CommunicatorGrid
 
 #ifdef ENABLE_MPI
-#include "hoomd/Communicator.h"
-#include "hoomd/CommunicatorGrid.h"
 #include "hoomd/extern/dfftlib/src/dfft_host.h"
 #include <mpi.h>
 #endif
@@ -89,7 +88,7 @@ class PYBIND11_EXPORT ESPForceCompute : public ForceCompute
     void slotGlobalParticleNumberChange() { m_ptls_added_removed = true; }
 
     protected:
-    void computeForces(uint64_t timestep) override;
+    void compute(uint64_t timestep) override;
 
     void setupMesh();
     void initializeFFT();
@@ -170,9 +169,10 @@ class PYBIND11_EXPORT ESPForceCompute : public ForceCompute
 #ifdef ENABLE_MPI
     dfft_plan m_dfft_plan_forward;
     dfft_plan m_dfft_plan_inverse;
-    std::unique_ptr<CommunicatorGrid<kiss_fft_cpx>> m_grid_comm_forward;
-    std::unique_ptr<CommunicatorGrid<kiss_fft_cpx>> m_grid_comm_reverse;
+    std::unique_ptr<hoomd::md::CommunicatorGrid<kiss_fft_cpx>> m_grid_comm_forward;
+    std::unique_ptr<hoomd::md::CommunicatorGrid<kiss_fft_cpx>> m_grid_comm_reverse;
 #endif
+    uint3 computeGhostCellNum();
     };
 
     } // namespace md
