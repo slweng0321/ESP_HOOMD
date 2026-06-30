@@ -1,209 +1,687 @@
-# Copyright (c) 2025 Shih-Lun Weng.
-# Part of RxMC, released under the BSD 3-Clause License.
+# Copyright (c) 2024-2026 ESP Plugin Contributors.
+# Released under the BSD 3-Clause License.
+#
+# hoomd_esp/esp.py
+#
+# Python-level wrappers for the ESP (Ewald Summation with Prolates) plugin.
+# Provides two public classes that mirror the HOOMD-blue PPPM API:
+#
+#   hoomd_esp.esp.Coulomb   – long-range mesh contribution
+#                             (wraps ESPForceCompute via md.long_range)
+#   hoomd_esp.esp.Pair      – short-range real-space contribution
+#                             (wraps PotentialPair<EvaluatorPairPSWF>)
+#
+# Typical usage
+# -------------
+#   import hoomd
+#   import hoomd_esp.esp as esp
+#
+#   sim = hoomd.Simulation(device=hoomd.device.GPU())
+#   sim.create_state_from_gsd("init.gsd")
+#
+#   nl = hoomd.md.nlist.Cell(buffer=0.4)
+#
+#   coulomb = esp.Coulomb(
+#       nlist=nl,
+#       default_r_cut=2.0,
+#       resolution=(64, 64, 64),
+#       order=6,
+#       kappa=1.0,
+#   )
+#
+#   pair = esp.Pair(
+#       nlist=nl,
+#       default_r_cut=2.0,
+#       coulomb=coulomb,
+#   )
+#   pair.params[("A", "A")] = {}   # all params come from Coulomb
+#   pair.r_cut[("A", "A")] = 2.0
+#
+#   integrator = hoomd.md.Integrator(dt=0.002)
+#   integrator.forces.append(coulomb)
+#   integrator.forces.append(pair)
+#   sim.operations.integrator = integrator
 
-"""Custom PPPM force wrappers used for RxMC."""
+from __future__ import annotations
 
 import math
+import warnings
+from typing import Optional, Sequence, Tuple, Union
 
 import hoomd
-from hoomd.md.force import Force
+import hoomd.md
 
-from .._core import _cpp, require_cpp_extension
+# ---------------------------------------------------------------------------
+# Try to import the compiled C++ extension.  If it is not found we raise a
+# clear ImportError rather than letting users see a cryptic AttributeError.
+# ---------------------------------------------------------------------------
+try:
+    from . import _esp  # compiled pybind11 extension (esp_plugin.so)
+except ImportError as _exc:
+    raise ImportError(
+        "hoomd_esp: compiled extension '_esp' not found.  "
+        "Please build the plugin with 'cmake --build' before importing."
+    ) from _exc
 
 
-def make_pppm_coulomb_forces(nlist, resolution, order, r_cut, alpha=0):
-    """Build the real/reciprocal Coulomb force pair used by RxMC.
+# ---------------------------------------------------------------------------
+# Module-level constants (kept in sync with ESPForceCompute.h)
+# ---------------------------------------------------------------------------
 
-    Args:
-        nlist: HOOMD neighbor list instance.
-        resolution: FFT mesh resolution ``(Nx, Ny, Nz)``.
-        order: PPPM interpolation order.
-        r_cut: Real-space cutoff.
-        alpha: Ewald damping parameter.
+#: Maximum supported PSWF interpolation order P.  Mirrors ESP_MAX_ORDER.
+MAX_ORDER: int = 8
 
-    Returns:
-        tuple: ``(real_space_force, reciprocal_space_force)``.
+#: Default number of look-up table segments for L(r).  Mirrors ESP_TABLE_SEGMENTS.
+DEFAULT_TABLE_SEGMENTS: int = 512
+
+#: Minimum table segments allowed.
+MIN_TABLE_SEGMENTS: int = 16
+
+
+# ===========================================================================
+# Utility helpers
+# ===========================================================================
+
+def _check_positive_int(val: int, name: str) -> None:
+    if not isinstance(val, int) or val <= 0:
+        raise ValueError(f"ESP: '{name}' must be a positive integer, got {val!r}.")
+
+
+def _check_positive_float(val: float, name: str) -> None:
+    if not (isinstance(val, (int, float)) and val > 0):
+        raise ValueError(f"ESP: '{name}' must be a positive number, got {val!r}.")
+
+
+def _check_nonneg_float(val: float, name: str) -> None:
+    if not (isinstance(val, (int, float)) and val >= 0):
+        raise ValueError(f"ESP: '{name}' must be >= 0, got {val!r}.")
+
+
+def _validate_resolution(res: Sequence[int]) -> Tuple[int, int, int]:
+    """Validate and unpack a (Nx, Ny, Nz) mesh-resolution tuple."""
+    res = tuple(int(v) for v in res)
+    if len(res) != 3:
+        raise ValueError(
+            f"ESP: 'resolution' must be a 3-tuple (Nx, Ny, Nz), got length {len(res)}."
+        )
+    for i, (v, label) in enumerate(zip(res, ("Nx", "Ny", "Nz"))):
+        _check_positive_int(v, f"resolution[{i}] ({label})")
+    return res  # type: ignore[return-value]
+
+
+def _estimate_kappa(r_cut: float, resolution: Tuple[int, int, int]) -> float:
+    """Rough default kappa = 3.2 / r_cut (PPPM-style rule of thumb)."""
+    return 3.2 / r_cut
+
+
+# ===========================================================================
+# class Coulomb
+# ===========================================================================
+
+class Coulomb(hoomd.md.force.Force):
+    """Long-range Coulomb force via the ESP mesh method.
+
+    Wraps ``ESPForceCompute`` (C++/CUDA) and exposes it with the same
+    keyword-argument interface as ``hoomd.md.long_range.pppm.Coulomb``.
+
+    The reciprocal-space contribution is computed on a regular mesh using a
+    PSWF-based charge-assignment kernel of order *P* and the corresponding
+    optimal influence function.  The short-range complement must be added via
+    :class:`Pair`.
+
+    Parameters
+    ----------
+    nlist:
+        Neighbor list used for the real-space exclusion correction.
+    default_r_cut:
+        Real-space cutoff radius *r_c* (in simulation length units).
+    resolution:
+        Global mesh size ``(Nx, Ny, Nz)``.  Each dimension should be even;
+        powers of two are required when running with MPI domain decomposition.
+    order:
+        PSWF interpolation order *P* (integer, 1 ≤ P ≤ 8).
+        Higher values give smaller mesh error at the cost of a wider stencil.
+        Recommended: 6 for ~10⁻⁸ accuracy.
+    kappa:
+        Ewald splitting parameter κ [1/length].  If ``None``, a
+        heuristic default of ``3.2 / r_cut`` is used.
+    alpha:
+        Debye–Hückel screening constant [1/length].  Set to 0 (default)
+        for pure Coulomb; set > 0 for Yukawa-screened electrostatics.
+    n_table:
+        Number of piecewise-polynomial segments used to tabulate *L(r)*.
+        Increase beyond 512 only for extremely high-accuracy requirements.
+    nlist_buffer:
+        Extra skin distance added to the neighbor-list cutoff to account for
+        particle motion between list rebuilds.  Defaults to 10 % of r_cut.
+
+    Attributes
+    ----------
+    kappa : float
+        Splitting parameter actually in use (may differ from the constructor
+        argument if the heuristic default was applied).
+    resolution : tuple[int, int, int]
+        Mesh dimensions ``(Nx, Ny, Nz)``.
+    order : int
+        PSWF interpolation order.
+    r_cut : float
+        Real-space cutoff.
+    alpha : float
+        Debye screening parameter (0 = pure Coulomb).
+    q_sum : float
+        Total system charge Σ qᵢ (available after the first time step).
+    q2_sum : float
+        Σ qᵢ² (available after the first time step).
+
+    Example
+    -------
+    .. code-block:: python
+
+        coulomb = esp.Coulomb(
+            nlist=nl,
+            default_r_cut=2.0,
+            resolution=(64, 64, 64),
+            order=6,
+            kappa=1.0,
+        )
+        integrator.forces.append(coulomb)
     """
-    real_space_force = hoomd.md.pair.Ewald(nlist)
-    real_space_force.params.default = dict(kappa=0, alpha=0)
-    real_space_force.r_cut.default = r_cut
 
-    reciprocal_space_force = Coulomb(
-        nlist=nlist,
-        resolution=resolution,
-        order=order,
-        r_cut=r_cut,
-        alpha=alpha,
-        pair_force=real_space_force,
-    )
-
-    return real_space_force, reciprocal_space_force
-
-
-class Coulomb(Force):
-    """Reciprocal-space PPPM force with a lighter charge-cache refresh path."""
-
-    def __init__(self, nlist, resolution, order, r_cut, alpha, pair_force):
-        """Initialize reciprocal-space PPPM force wrapper.
-
-        Args:
-            nlist: HOOMD neighbor list instance.
-            resolution: FFT mesh resolution ``(Nx, Ny, Nz)``.
-            order: PPPM interpolation order.
-            r_cut: Real-space cutoff.
-            alpha: Ewald damping parameter.
-            pair_force: Real-space Ewald pair force coupled to this object.
-        """
+    def __init__(
+        self,
+        nlist: hoomd.md.nlist.NList,
+        default_r_cut: float,
+        resolution: Sequence[int] = (32, 32, 32),
+        order: int = 6,
+        kappa: Optional[float] = None,
+        alpha: float = 0.0,
+        n_table: int = DEFAULT_TABLE_SEGMENTS,
+        nlist_buffer: Optional[float] = None,
+    ) -> None:
         super().__init__()
-        self._nlist = hoomd.data.typeconverter.OnlyTypes(hoomd.md.nlist.NeighborList)(
-            nlist
-        )
-        self._param_dict.update(
-            hoomd.data.parameterdicts.ParameterDict(
-                resolution=(int, int, int),
-                order=int,
-                r_cut=float,
-                alpha=float,
+
+        # ── validate inputs ────────────────────────────────────────────────
+        _check_positive_float(default_r_cut, "default_r_cut")
+        res = _validate_resolution(resolution)
+
+        if not (isinstance(order, int) and 1 <= order <= MAX_ORDER):
+            raise ValueError(
+                f"ESP: 'order' must be an integer in [1, {MAX_ORDER}], got {order!r}."
             )
-        )
-        self.resolution = resolution
-        self.order = order
-        self.r_cut = r_cut
-        self.alpha = alpha
-        self._pair_force = pair_force
 
-    def _attach_hook(self) -> None:
-        self.nlist._attach(self._simulation)
-
-        if isinstance(self._simulation.device, hoomd.device.CPU):
-            cls = _cpp.CustomPPPMForceCompute
+        if kappa is None:
+            kappa = _estimate_kappa(default_r_cut, res)
+            warnings.warn(
+                f"ESP: 'kappa' not specified; using heuristic kappa = {kappa:.4f} "
+                f"(= 3.2 / r_cut).  For production runs, tune kappa explicitly.",
+                stacklevel=2,
+            )
         else:
-            cls = _cpp.CustomPPPMForceComputeGPU
+            _check_positive_float(kappa, "kappa")
 
-        nx, ny, nz = self.resolution
-        order = self.order
-        rcut = self.r_cut
-        alpha = self.alpha
+        _check_nonneg_float(alpha, "alpha")
 
-        group = self._simulation.state._get_group(hoomd.filter.All())
-        self._cpp_obj = cls(
-            self._simulation.state._cpp_sys_def,
-            self.nlist._cpp_obj,
-            group,
-        )
-
-        q2 = self._cpp_obj.getQ2Sum()
-        num_particles = self._simulation.state.N_particles
-        box = self._simulation.state.box
-        lx = box.Lx
-        ly = box.Ly
-        lz = box.Lz
-
-        hx = lx / nx
-        hy = ly / ny
-        hz = lz / nz
-
-        gew1 = 0.0
-        kappa = gew1
-        f = _diffpr(hx, hy, hz, lx, ly, lz, num_particles, order, kappa, q2, rcut)
-        hmin = min(hx, hy, hz)
-        gew2 = 10.0 / hmin
-        kappa = gew2
-        fmid = _diffpr(hx, hy, hz, lx, ly, lz, num_particles, order, kappa, q2, rcut)
-
-        if f * fmid >= 0.0:
-            raise RuntimeError(
-                "Cannot compute custom PPPM Coulomb forces: f*fmid >= 0.0"
+        if not (isinstance(n_table, int) and n_table >= MIN_TABLE_SEGMENTS):
+            raise ValueError(
+                f"ESP: 'n_table' must be an integer >= {MIN_TABLE_SEGMENTS}, "
+                f"got {n_table!r}."
             )
 
-        if f < 0.0:
-            dgew = gew2 - gew1
-            rtb = gew1
-        else:
-            dgew = gew1 - gew2
-            rtb = gew2
+        # ── store parameters ───────────────────────────────────────────────
+        self._nlist        = nlist
+        self._r_cut        = float(default_r_cut)
+        self._resolution   = res
+        self._order        = int(order)
+        self._kappa        = float(kappa)
+        self._alpha        = float(alpha)
+        self._n_table      = int(n_table)
 
-        ncount = 0
-        while math.fabs(dgew) > 0.00001 and fmid != 0.0:
-            dgew *= 0.5
-            kappa = rtb + dgew
-            fmid = _diffpr(
-                hx, hy, hz, lx, ly, lz, num_particles, order, kappa, q2, rcut
-            )
-            if fmid <= 0.0:
-                rtb = kappa
-            ncount += 1
-            if ncount > 10000.0:
-                raise RuntimeError("Cannot compute custom PPPM kappa: not converging")
+        if nlist_buffer is None:
+            nlist_buffer = 0.1 * self._r_cut
+        self._nlist_buffer = float(nlist_buffer)
 
-        particle_types = self._simulation.state.particle_types
-        for type_a in particle_types:
-            for type_b in particle_types:
-                self._pair_force.params[(type_a, type_b)] = dict(
-                    kappa=kappa, alpha=alpha
-                )
-                self._pair_force.r_cut[(type_a, type_b)] = rcut
+        # ── C++ object (created lazily in _attach) ─────────────────────────
+        self._cpp_obj: Optional[_esp.ESPForceCompute] = None
 
-        self._cpp_obj.setParams(nx, ny, nz, order, kappa, rcut, alpha)
+        # ── back-reference used by esp.Pair ───────────────────────────────
+        self._pair: Optional["Pair"] = None
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
-    def nlist(self):
-        """hoomd.md.nlist.NeighborList: Neighbor list used by this force."""
-        return self._nlist
+    def kappa(self) -> float:
+        """Ewald splitting parameter κ [1/length]."""
+        if self._cpp_obj is not None:
+            return self._cpp_obj.getKappa()
+        return self._kappa
+
+    @property
+    def resolution(self) -> Tuple[int, int, int]:
+        """Global mesh dimensions (Nx, Ny, Nz)."""
+        if self._cpp_obj is not None:
+            return tuple(self._cpp_obj.getResolution())  # type: ignore[return-value]
+        return self._resolution
+
+    @property
+    def order(self) -> int:
+        """PSWF interpolation order P."""
+        if self._cpp_obj is not None:
+            return self._cpp_obj.getOrder()
+        return self._order
+
+    @property
+    def r_cut(self) -> float:
+        """Real-space cutoff radius r_c."""
+        if self._cpp_obj is not None:
+            return self._cpp_obj.getRCut()
+        return self._r_cut
+
+    @property
+    def alpha(self) -> float:
+        """Debye screening parameter α (0 = pure Coulomb)."""
+        if self._cpp_obj is not None:
+            return self._cpp_obj.getAlpha()
+        return self._alpha
+
+    @property
+    def q_sum(self) -> float:
+        """Total system charge Σ qᵢ (updated each time step)."""
+        if self._cpp_obj is None:
+            raise RuntimeError("ESP: q_sum not available before simulation attachment.")
+        return self._cpp_obj.getQSum()
+
+    @property
+    def q2_sum(self) -> float:
+        """Sum Σ qᵢ² (updated each time step)."""
+        if self._cpp_obj is None:
+            raise RuntimeError("ESP: q2_sum not available before simulation attachment.")
+        return self._cpp_obj.getQ2Sum()
+
+    # ------------------------------------------------------------------
+    # Parameter update at runtime
+    # ------------------------------------------------------------------
+
+    def set_params(
+        self,
+        *,
+        resolution: Optional[Sequence[int]] = None,
+        order: Optional[int] = None,
+        kappa: Optional[float] = None,
+        r_cut: Optional[float] = None,
+        alpha: Optional[float] = None,
+        n_table: Optional[int] = None,
+    ) -> None:
+        """Update ESP parameters at runtime and trigger re-initialisation.
+
+        All keyword arguments are optional; only the supplied values are
+        updated.  The change takes effect on the *next* call to
+        ``computeForces()``.
+
+        Parameters
+        ----------
+        resolution:
+            New mesh dimensions ``(Nx, Ny, Nz)``.
+        order:
+            New PSWF interpolation order.
+        kappa:
+            New splitting parameter.
+        r_cut:
+            New real-space cutoff.
+        alpha:
+            New Debye screening constant.
+        n_table:
+            New look-up table size.
+
+        Raises
+        ------
+        RuntimeError
+            If called before the Simulation is attached.
+        """
+        if self._cpp_obj is None:
+            raise RuntimeError(
+                "ESP: set_params() called before the Simulation was attached.  "
+                "Pass initial values to the Coulomb constructor instead."
+            )
+
+        if resolution is not None:
+            self._resolution = _validate_resolution(resolution)
+        if order is not None:
+            if not (isinstance(order, int) and 1 <= order <= MAX_ORDER):
+                raise ValueError(f"ESP: invalid order {order!r}.")
+            self._order = int(order)
+        if kappa is not None:
+            _check_positive_float(kappa, "kappa")
+            self._kappa = float(kappa)
+        if r_cut is not None:
+            _check_positive_float(r_cut, "r_cut")
+            self._r_cut = float(r_cut)
+        if alpha is not None:
+            _check_nonneg_float(alpha, "alpha")
+            self._alpha = float(alpha)
+        if n_table is not None:
+            if not (isinstance(n_table, int) and n_table >= MIN_TABLE_SEGMENTS):
+                raise ValueError(f"ESP: invalid n_table {n_table!r}.")
+            self._n_table = int(n_table)
+
+        # Push updated parameters to C++ and mark for re-initialisation.
+        nx, ny, nz = self._resolution
+        self._cpp_obj.setParams(
+            nx, ny, nz,
+            self._order,
+            self._kappa,
+            self._r_cut,
+            self._alpha,
+            self._n_table,
+        )
+        # Propagate r_cut change to the associated Pair evaluator.
+        if self._pair is not None:
+            self._pair._sync_params_from_coulomb()
+
+    def invalidate(self) -> None:
+        """Force a full re-initialisation on the next compute step.
+
+        Useful after e.g. box-resize operations that do not automatically
+        trigger a recompute of the influence function.
+        """
+        if self._cpp_obj is not None:
+            self._cpp_obj.invalidate()
+
+    # ------------------------------------------------------------------
+    # HOOMD lifecycle
+    # ------------------------------------------------------------------
+
+    def _attach_hook(self) -> None:
+        """Create the C++ ESPForceCompute and register it with HOOMD."""
+        sim: hoomd.Simulation = self._simulation  # type: ignore[assignment]
+        sysdef = sim.state._cpp_sys_def
+        nlist_cpp = self._nlist._cpp_obj
+        group_cpp = sim.state.all_group._cpp_obj  # act on all particles
+
+        self._cpp_obj = _esp.ESPForceCompute(sysdef, nlist_cpp, group_cpp)
+
+        nx, ny, nz = self._resolution
+        self._cpp_obj.setParams(
+            nx, ny, nz,
+            self._order,
+            self._kappa,
+            self._r_cut,
+            self._alpha,
+            self._n_table,
+        )
+
+        # Hand the underlying C++ object to the base class so HOOMD can
+        # call computeForces() each time step.
+        self._cpp_force = self._cpp_obj  # type: ignore[attr-defined]
+
+    def _detach_hook(self) -> None:
+        """Release the C++ object when detached from a Simulation."""
+        self._cpp_obj  = None
+        self._cpp_force = None  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # Repr
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        return (
+            f"esp.Coulomb("
+            f"resolution={self._resolution}, "
+            f"order={self._order}, "
+            f"kappa={self._kappa:.4g}, "
+            f"r_cut={self._r_cut}, "
+            f"alpha={self._alpha})"
+        )
 
 
-def _rms(h, prd, natoms, order, kappa, q2):
-    acons = {
-        1: [2.0 / 3.0],
-        2: [1.0 / 50.0, 5.0 / 294.0],
-        3: [1.0 / 588.0, 7.0 / 1440.0, 21.0 / 3872.0],
-        4: [1.0 / 4320.0, 3.0 / 1936.0, 7601.0 / 2271360.0, 143.0 / 28800.0],
-        5: [
-            1.0 / 23232.0,
-            7601.0 / 13628160.0,
-            143.0 / 69120.0,
-            517231.0 / 106536960.0,
-            106640677.0 / 11737571328.0,
-        ],
-        6: [
-            691.0 / 68140800.0,
-            13.0 / 57600.0,
-            47021.0 / 35512320.0,
-            9694607.0 / 2095994880.0,
-            733191589.0 / 59609088000.0,
-            326190917.0 / 11700633600.0,
-        ],
-        7: [
-            1.0 / 345600.0,
-            3617.0 / 35512320.0,
-            745739.0 / 838397952.0,
-            56399353.0 / 12773376000.0,
-            25091609.0 / 1560084480.0,
-            1755948832039.0 / 36229939200000.0,
-            4887769399.0 / 37838389248.0,
-        ],
-    }
-    series = 0.0
-    for exponent, coeff in enumerate(acons[order]):
-        series += coeff * pow(h * kappa, 2.0 * exponent)
-    return (
-        q2
-        * pow(h * kappa, order)
-        * math.sqrt(kappa * prd * math.sqrt(2.0 * math.pi) * series / natoms)
-        / (prd * prd)
+# ===========================================================================
+# class Pair
+# ===========================================================================
+
+class Pair(hoomd.md.pair.Pair):
+    """Short-range real-space complement for the ESP mesh method.
+
+    Wraps ``PotentialPair<EvaluatorPairPSWF>`` (C++) and must always be used
+    together with :class:`Coulomb`.  The pair evaluator reads the PSWF look-up
+    table pointer and the splitting parameters (κ, r_c, α) directly from the
+    associated :class:`Coulomb` object, so ``params`` dictionaries for each
+    type-pair contain **no user-settable fields**.
+
+    Parameters
+    ----------
+    nlist:
+        Neighbor list (should be the same instance passed to :class:`Coulomb`).
+    default_r_cut:
+        Default real-space cutoff for all type pairs.  Should match the value
+        given to :class:`Coulomb`.
+    coulomb:
+        The associated :class:`Coulomb` instance.  The pair evaluator will
+        pull κ, r_c, α, and the L(r) table pointer from this object.
+    default_r_on:
+        Inner smoothing radius (0 = sharp cutoff, which is correct for ESP
+        since L(r) already goes smoothly to zero at r_c).
+    mode:
+        Shifting mode: ``"none"`` (default, correct for ESP) or ``"shift"``.
+        ESP's L(r) is constructed to vanish at r_c, so no additional shifting
+        is needed.
+
+    Example
+    -------
+    .. code-block:: python
+
+        pair = esp.Pair(
+            nlist=nl,
+            default_r_cut=2.0,
+            coulomb=coulomb,
+        )
+        # Register every type-pair that carries a charge.
+        for t1 in sim.state.particle_types:
+            for t2 in sim.state.particle_types:
+                pair.params[(t1, t2)] = {}
+                pair.r_cut[(t1, t2)] = 2.0
+        integrator.forces.append(pair)
+    """
+
+    # ------------------------------------------------------------------ #
+    # EvaluatorPairPSWF requires charge data from the ParticleData.       #
+    # We declare this at class level so HOOMD knows to pass charges.       #
+    # ------------------------------------------------------------------ #
+    _accepted_modes = ("none",)  # ESP pair does not need XPLOR smoothing
+
+    def __init__(
+        self,
+        nlist: hoomd.md.nlist.NList,
+        default_r_cut: float,
+        coulomb: Coulomb,
+        default_r_on: float = 0.0,
+        mode: str = "none",
+    ) -> None:
+        if not isinstance(coulomb, Coulomb):
+            raise TypeError(
+                "ESP: 'coulomb' must be an esp.Coulomb instance, "
+                f"got {type(coulomb).__name__!r}."
+            )
+        if mode not in ("none",):
+            raise ValueError(
+                "ESP: Pair mode must be 'none' for ESP (L(r) already vanishes at r_c)."
+            )
+
+        super().__init__(
+            nlist=nlist,
+            default_r_cut=default_r_cut,
+            default_r_on=default_r_on,
+            mode=mode,
+        )
+
+        self._coulomb = coulomb
+        coulomb._pair  = self  # cross-reference for runtime param sync
+
+    # ------------------------------------------------------------------
+    # params validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_params(params: dict) -> dict:
+        """ESP pair parameters carry no user-settable fields.
+
+        Accepts an empty dict ``{}``; all physical parameters (κ, r_c, α,
+        table pointer) are sourced from the associated :class:`Coulomb`
+        object at attach time.
+        """
+        if params and set(params.keys()) - {"_reserved"}:
+            warnings.warn(
+                "ESP: Pair.params accepts an empty dict {}; all ESP parameters "
+                "are read from the associated Coulomb object.  "
+                f"Ignoring keys: {set(params.keys())!r}.",
+                stacklevel=3,
+            )
+        return {}
+
+    # ------------------------------------------------------------------
+    # HOOMD lifecycle
+    # ------------------------------------------------------------------
+
+    def _attach_hook(self) -> None:
+        """Create PotentialPair<EvaluatorPairPSWF> and push table pointer."""
+        super()._attach_hook()
+        self._sync_params_from_coulomb()
+
+    def _sync_params_from_coulomb(self) -> None:
+        """Push current ESP parameters from Coulomb into the C++ pair object.
+
+        This method is called:
+        - once at attach time (after both Coulomb and Pair are attached),
+        - whenever Coulomb.set_params() updates κ, r_c, α, or the table.
+
+        The table pointer is obtained from the Coulomb C++ object, which owns
+        the ``m_pswf_table_gpu`` GPUArray.  Passing a ``uintptr_t`` avoids any
+        Python-level ownership issue—the GPUArray outlives the pointer because
+        both objects share the same Simulation lifetime.
+        """
+        if self._cpp_obj is None:
+            return  # not yet attached; will be called again in _attach_hook
+        if self._coulomb._cpp_obj is None:
+            raise RuntimeError(
+                "ESP: Pair._sync_params_from_coulomb() called but the associated "
+                "Coulomb object is not attached.  Attach Coulomb before Pair."
+            )
+
+        cpp_coulomb = self._coulomb._cpp_obj
+        kappa    = cpp_coulomb.getKappa()
+        r_cut    = cpp_coulomb.getRCut()
+        alpha    = cpp_coulomb.getAlpha()
+        n_segs   = cpp_coulomb.getTableSize()
+        # getTablePtr() returns a Python int holding the device pointer
+        # (uintptr_t).  EvaluatorPairPSWF stores it as const Scalar*.
+        table_ptr = cpp_coulomb.getTablePtr()
+
+        # Build param_type-compatible dict for each registered type pair.
+        # The C++ evaluator reads: kappa, rcut, alpha, n_segs, table_ptr.
+        for key in list(self.params.keys()):
+            self.params[key] = dict(
+                kappa     = kappa,
+                rcut      = r_cut,
+                alpha     = alpha,
+                n_segs    = n_segs,
+                table_ptr = table_ptr,
+            )
+
+    def _detach_hook(self) -> None:
+        super()._detach_hook()
+        self._coulomb._pair = None
+
+    # ------------------------------------------------------------------
+    # Repr
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        return (
+            f"esp.Pair(r_cut={self._coulomb._r_cut}, "
+            f"kappa={self._coulomb._kappa:.4g}, "
+            f"alpha={self._coulomb._alpha})"
+        )
+
+
+# ===========================================================================
+# Convenience factory
+# ===========================================================================
+
+def make_esp(
+    nlist: hoomd.md.nlist.NList,
+    r_cut: float,
+    resolution: Sequence[int] = (32, 32, 32),
+    order: int = 6,
+    kappa: Optional[float] = None,
+    alpha: float = 0.0,
+    n_table: int = DEFAULT_TABLE_SEGMENTS,
+) -> Tuple[Coulomb, Pair]:
+    """Create a matched (Coulomb, Pair) pair ready to add to an integrator.
+
+    This convenience function constructs both the long-range mesh force and the
+    short-range pair complement with consistent parameters and registers the
+    cross-reference between them.
+
+    Parameters
+    ----------
+    nlist:
+        Shared neighbor list.
+    r_cut:
+        Real-space cutoff (same for both components).
+    resolution:
+        Mesh dimensions ``(Nx, Ny, Nz)``.
+    order:
+        PSWF interpolation order P.
+    kappa:
+        Splitting parameter κ.  Heuristic default if ``None``.
+    alpha:
+        Debye screening constant (0 = pure Coulomb).
+    n_table:
+        Look-up table size.
+
+    Returns
+    -------
+    coulomb : Coulomb
+        The long-range mesh force.
+    pair : Pair
+        The short-range real-space complement.
+
+    Example
+    -------
+    .. code-block:: python
+
+        coulomb, pair = esp.make_esp(
+            nlist=nl, r_cut=2.0, resolution=(64, 64, 64), order=6, kappa=1.0
+        )
+        integrator.forces.extend([coulomb, pair])
+        # Register type pairs:
+        for t1 in sim.state.particle_types:
+            for t2 in sim.state.particle_types:
+                pair.params[(t1, t2)] = {}
+                pair.r_cut[(t1, t2)]  = 2.0
+    """
+    coulomb = Coulomb(
+        nlist=nlist,
+        default_r_cut=r_cut,
+        resolution=resolution,
+        order=order,
+        kappa=kappa,
+        alpha=alpha,
+        n_table=n_table,
     )
+    pair = Pair(nlist=nlist, default_r_cut=r_cut, coulomb=coulomb)
+    return coulomb, pair
 
 
-def _diffpr(hx, hy, hz, lx, ly, lz, natoms, order, kappa, q2, rcut):
-    lprx = _rms(hx, lx, natoms, order, kappa, q2)
-    lpry = _rms(hy, ly, natoms, order, kappa, q2)
-    lprz = _rms(hz, lz, natoms, order, kappa, q2)
-    lpr = math.sqrt(lprx * lprx + lpry * lpry + lprz * lprz) / math.sqrt(3.0)
-    spr = (
-        2.0
-        * q2
-        * math.exp(-kappa * kappa * rcut * rcut)
-        / math.sqrt(natoms * rcut * lx * ly * lz)
-    )
-    value = lpr - spr
-    return value
+# ===========================================================================
+# __all__
+# ===========================================================================
+
+__all__ = [
+    "Coulomb",
+    "Pair",
+    "make_esp",
+    "MAX_ORDER",
+    "DEFAULT_TABLE_SEGMENTS",
+    "MIN_TABLE_SEGMENTS",
+]
