@@ -7,7 +7,13 @@
 
 #include "ESPForceComputeGPU.h"
 
+#include <algorithm>
 #include <cmath>
+
+namespace hoomd
+    {
+namespace md
+    {
 
 namespace
     {
@@ -201,12 +207,7 @@ __global__ void gpu_fix_exclusions_kernel(unsigned int n,
         }
     }
 
-    } // namespace
-
-namespace hoomd
-    {
-namespace md
-    {
+} // namespace
 
 /*! \brief Construct a GPU ESP force compute. */
 ESPForceComputeGPU::ESPForceComputeGPU(std::shared_ptr<SystemDefinition> sysdef,
@@ -368,10 +369,10 @@ void ESPForceComputeGPU::initializeFFT()
         m_cufft_initialized = true;
         }
 
-    GPUArray<hipfftComplex> mesh(m_n_cells + m_ghost_offset, m_exec_conf);
+    GPUArray<hipfftComplex> mesh(m_n_cells, m_exec_conf);
     m_mesh.swap(mesh);
 
-    unsigned int inv_mesh_elements = m_n_cells + m_ghost_offset;
+    unsigned int inv_mesh_elements = m_n_cells;
     GPUArray<hipfftComplex> mesh_scratch(inv_mesh_elements, m_exec_conf);
     m_mesh_scratch.swap(mesh_scratch);
 
@@ -383,7 +384,8 @@ void ESPForceComputeGPU::initializeFFT()
     m_inv_fourier_mesh_z.swap(inv_fourier_mesh_z);
 
     unsigned int n_blocks
-        = (m_mesh_points.x * m_mesh_points.y * m_mesh_points.z) / m_block_size + 1;
+        = (m_mesh_points.x * m_mesh_points.y * m_mesh_points.z + m_block_size - 1)
+          / m_block_size;
     GPUArray<Scalar> sum_partial(n_blocks, m_exec_conf);
     m_sum_partial.swap(sum_partial);
     GPUArray<Scalar> sum_virial_partial(6 * n_blocks, m_exec_conf);
@@ -548,7 +550,6 @@ void ESPForceComputeGPU::launchInfluenceFunctionKernel()
 
     ArrayHandle<Scalar> d_inf_f(m_inf_f, access_location::device, access_mode::overwrite);
     ArrayHandle<Scalar3> d_k(m_k, access_location::device, access_mode::overwrite);
-    ArrayHandle<Scalar> d_gf_b(m_gf_b, access_location::device, access_mode::read);
     ArrayHandle<Scalar> d_denom(m_sum_partial, access_location::device, access_mode::overwrite);
 
     const uint3 dim = m_mesh_points;
@@ -619,16 +620,35 @@ void ESPForceComputeGPU::fixExclusionsGPU()
                                                          d_pos.data,
                                                          d_chg.data,
                                                          d_force.data,
+                                                         d_virial.data,
                                                          d_nex.data,
                                                          d_exlist.data,
                                                          ex_idx,
                                                          table,
                                                          m_n_table_segments,
                                                          m_rcut,
-                                                         d_virial.data,
                                                          m_pdata->getBox());
     if (m_exec_conf->isCUDAErrorCheckingEnabled())
         CHECK_CUDA_ERROR();
+    }
+
+void ESPForceComputeGPU::computeBodyCorrection()
+    {
+    refreshChargeDependentState();
+    ESPForceCompute::computeBodyCorrection();
+    }
+
+void ESPForceComputeGPU::refreshChargeDependentState()
+    {
+    m_q  = Scalar(0.0);
+    m_q2 = Scalar(0.0);
+    ArrayHandle<Scalar> h_charge(m_pdata->getCharges(), access_location::host, access_mode::read);
+    for (unsigned int idx = 0; idx < m_pdata->getN(); ++idx)
+        {
+        const Scalar q = h_charge.data[idx];
+        m_q += q;
+        m_q2 += q * q;
+        }
     }
 
     } // end namespace md

@@ -13,20 +13,23 @@
 
 #include "ESPForceCompute.h"
 #include "hoomd/Autotuner.h"
+#include "hoomd/GPUFlags.h"
 
+#ifdef ENABLE_HIP
+#include <hipfft.h>
+#endif
+
+#include <memory>
 #include <sstream>
 
 namespace hoomd
     {
 namespace md
     {
-/*! \brief GPU-accelerated ESP force compute.
- */
+
 class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
     {
     public:
-    /*! \brief Construct a GPU ESP force compute.
-     */
     ESPForceComputeGPU(std::shared_ptr<SystemDefinition> sysdef,
                        std::shared_ptr<NeighborList> nlist,
                        std::shared_ptr<ParticleGroup> group);
@@ -34,41 +37,21 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
     ~ESPForceComputeGPU() override;
 
     protected:
-    /*! \brief Setup FFT plans and allocate GPU mesh arrays. */
-    void initializeFFT() override;
+    void initializeFFT();
+    void assignParticles();
+    void updateMeshes();
+    void interpolateForces();
+    void computeInfluenceFunction();
+    Scalar computePE();
+    void fixExclusions();
 
-    /*! \brief Assign particle charges to the GPU mesh. */
-    void assignParticles() override;
-
-    /*! \brief Update the reciprocal mesh on GPU. */
-    void updateMeshes() override;
-
-    /*! \brief Interpolate forces from the inverse mesh. */
-    void interpolateForces() override;
-
-    /*! \brief Compute the influence function on GPU. */
-    void computeInfluenceFunction() override;
-
-    /*! \brief Compute reciprocal-space potential energy. */
-    Scalar computePE() override;
-
-    /*! \brief Correct excluded-pair forces on GPU. */
-    void fixExclusions() override;
-
-    /*! \brief Build the GPU influence function from the PSWF table. */
     void computeInfluenceFunctionGPU();
-
-    /*! \brief Launch the GPU kernel that builds the influence function. */
     void launchInfluenceFunctionKernel();
-
-    /*! \brief Launch the GPU kernel that evaluates the PSWF denominator. */
     void launchGFDenominatorKernel();
-
-    /*! \brief Apply excluded-pair corrections on the GPU. */
     void fixExclusionsGPU();
-
     void refreshChargeDependentState();
 
+#ifdef ENABLE_HIP
     inline void handleHIPFFTResult(hipfftResult result,
                                    const char* file,
                                    unsigned int line) const
@@ -81,6 +64,7 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
             throw std::runtime_error(oss.str());
             }
         }
+#endif
 
     private:
     std::shared_ptr<Autotuner<1>> m_tuner_assign;
@@ -88,7 +72,9 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
     std::shared_ptr<Autotuner<1>> m_tuner_force;
     std::shared_ptr<Autotuner<1>> m_tuner_influence;
 
+#ifdef ENABLE_HIP
     hipfftHandle m_hipfft_plan;
+#endif
     bool m_local_fft;
     bool m_cufft_initialized;
     bool m_cuda_dfft_initialized;
@@ -116,4 +102,3 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
 
     } // namespace md
     } // namespace hoomd
-
