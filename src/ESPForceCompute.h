@@ -32,6 +32,7 @@
 #include "hoomd/Index1D.h"
 #include "hoomd/MeshDefinition.h"
 #include "hoomd/NeighborList.h"
+#include "hoomd/NeighborList.h"
 #include "hoomd/ParticleGroup.h"
 
 #ifdef ENABLE_MPI
