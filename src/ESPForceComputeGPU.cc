@@ -7,8 +7,201 @@
 
 #include "ESPForceComputeGPU.h"
 
-#ifdef ENABLE_HIP
-#include "ESPForceComputeGPU.cuh"
+#include <cmath>
+
+namespace
+    {
+__device__ inline Scalar gpu_eval_gf_denom(const Scalar* gf_b, Scalar x, Scalar y, Scalar z)
+    {
+    Scalar denom = Scalar(0.0);
+    const Scalar s = x + y + z;
+    for (int l = 0; l < 12; ++l)
+        denom = denom * s + gf_b[l];
+    return std::max(denom, Scalar(1.0e-12));
+    }
+
+__global__ void gpu_build_gf_denom_kernel(uint3 dim,
+                                          Scalar box_lx,
+                                          Scalar box_ly,
+                                          Scalar box_lz,
+                                          Scalar rcut,
+                                          const Scalar* gf_b,
+                                          Scalar* denom_out)
+    {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int n = dim.x * dim.y * dim.z;
+    if (idx >= n)
+        return;
+
+    const unsigned int ix = idx % dim.x;
+    const unsigned int iy = (idx / dim.x) % dim.y;
+    const unsigned int iz = idx / (dim.x * dim.y);
+
+    const int kx = (ix <= dim.x / 2) ? static_cast<int>(ix)
+                                     : static_cast<int>(ix) - static_cast<int>(dim.x);
+    const int ky = (iy <= dim.y / 2) ? static_cast<int>(iy)
+                                     : static_cast<int>(iy) - static_cast<int>(dim.y);
+    const int kz = (iz <= dim.z / 2) ? static_cast<int>(iz)
+                                     : static_cast<int>(iz) - static_cast<int>(dim.z);
+
+    const Scalar twopi = Scalar(2.0) * Scalar(M_PI);
+    const Scalar kx_phys = twopi * Scalar(kx) / box_lx;
+    const Scalar ky_phys = twopi * Scalar(ky) / box_ly;
+    const Scalar kz_phys = twopi * Scalar(kz) / box_lz;
+
+    const Scalar x = (kx_phys * rcut) * (kx_phys * rcut);
+    const Scalar y = (ky_phys * rcut) * (ky_phys * rcut);
+    const Scalar z = (kz_phys * rcut) * (kz_phys * rcut);
+    denom_out[idx] = gpu_eval_gf_denom(gf_b, x, y, z);
+    }
+
+__global__ void gpu_build_influence_kernel(uint3 dim,
+                                           Scalar box_lx,
+                                           Scalar box_ly,
+                                           Scalar box_lz,
+                                           Scalar kappa,
+                                           Scalar alpha,
+                                           const Scalar* denom,
+                                           Scalar* inf_f,
+                                           Scalar3* kvec)
+    {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int n = dim.x * dim.y * dim.z;
+    if (idx >= n)
+        return;
+
+    const unsigned int ix = idx % dim.x;
+    const unsigned int iy = (idx / dim.x) % dim.y;
+    const unsigned int iz = idx / (dim.x * dim.y);
+
+    const int kx = (ix <= dim.x / 2) ? static_cast<int>(ix)
+                                     : static_cast<int>(ix) - static_cast<int>(dim.x);
+    const int ky = (iy <= dim.y / 2) ? static_cast<int>(iy)
+                                     : static_cast<int>(iy) - static_cast<int>(dim.y);
+    const int kz = (iz <= dim.z / 2) ? static_cast<int>(iz)
+                                     : static_cast<int>(iz) - static_cast<int>(dim.z);
+
+    const Scalar twopi = Scalar(2.0) * Scalar(M_PI);
+    const Scalar kx_phys = twopi * Scalar(kx) / box_lx;
+    const Scalar ky_phys = twopi * Scalar(ky) / box_ly;
+    const Scalar kz_phys = twopi * Scalar(kz) / box_lz;
+
+    const Scalar k2 = kx_phys * kx_phys + ky_phys * ky_phys + kz_phys * kz_phys;
+    kvec[idx] = make_scalar3(kx_phys, ky_phys, kz_phys);
+
+    if (k2 < Scalar(1.0e-20))
+        {
+        inf_f[idx] = Scalar(0.0);
+        return;
+        }
+
+    const Scalar k = std::sqrt(k2);
+    const Scalar exp_term = std::exp(-k2 / (Scalar(4.0) * kappa * kappa));
+    const Scalar screening = (alpha > Scalar(0.0)) ? std::exp(-alpha * k) : Scalar(1.0);
+    inf_f[idx] = screening * exp_term / (k2 * denom[idx]);
+    }
+
+__global__ void gpu_fix_exclusions_kernel(unsigned int n,
+                                          const Scalar4* pos,
+                                          const Scalar* chg,
+                                          Scalar4* force,
+                                          Scalar* virial,
+                                          const unsigned int* nex,
+                                          const unsigned int* exlist,
+                                          Index2D ex_idx,
+                                          const ESPTableEntry* table,
+                                          unsigned int n_segs,
+                                          Scalar rcut,
+                                          const BoxDim box)
+    {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+
+    const Scalar4 pi4 = pos[i];
+    const Scalar3 pi = make_scalar3(pi4.x, pi4.y, pi4.z);
+    const Scalar qi = chg[i];
+
+    for (unsigned int ex = 0; ex < nex[i]; ++ex)
+        {
+        const unsigned int j = exlist[ex_idx(ex, i)];
+        if (j <= i || j >= n)
+            continue;
+
+        const Scalar4 pj4 = pos[j];
+        const Scalar3 pj = make_scalar3(pj4.x, pj4.y, pj4.z);
+        const Scalar qj = chg[j];
+
+        Scalar3 rij = pj - pi;
+        rij = box.minImage(rij);
+        const Scalar rsq = dot(rij, rij);
+        if (rsq < Scalar(1.0e-20))
+            continue;
+
+        const Scalar r = std::sqrt(rsq);
+        const Scalar s = std::min(Scalar(1.0) - Scalar(1.0e-9), r / rcut);
+        const unsigned int seg = min(static_cast<unsigned int>(s * Scalar(n_segs)), n_segs - 1u);
+        const ESPTableEntry e = table[seg];
+        const Scalar t = (r - e.r_lo) * e.dr_inv;
+
+        const Scalar pc[5] = {e.potential_coeffs.x,
+                              e.potential_coeffs.y,
+                              e.potential_coeffs.z,
+                              e.potential_coeffs.w,
+                              e.potential_coeff4};
+        const Scalar fc[5] = {e.force_coeffs.x,
+                              e.force_coeffs.y,
+                              e.force_coeffs.z,
+                              e.force_coeffs.w,
+                              e.force_coeff4};
+
+        Scalar Lr = pc[4];
+        Scalar mdLdr = fc[4];
+        for (int k = 3; k >= 0; --k)
+            {
+            Lr = Lr * t + pc[k];
+            mdLdr = mdLdr * t + fc[k];
+            }
+
+        const Scalar qiqj = qi * qj;
+        const Scalar invr = Scalar(1.0) / r;
+        const Scalar force_divr = qiqj * (-invr * invr + mdLdr) * invr;
+        const Scalar3 f = force_divr * rij;
+
+        atomicAdd(&force[i].x, -f.x);
+        atomicAdd(&force[i].y, -f.y);
+        atomicAdd(&force[i].z, -f.z);
+        atomicAdd(&force[j].x, f.x);
+        atomicAdd(&force[j].y, f.y);
+        atomicAdd(&force[j].z, f.z);
+
+        atomicAdd(&force[i].w, Scalar(0.5) * qiqj * (invr - Lr));
+        atomicAdd(&force[j].w, Scalar(0.5) * qiqj * (invr - Lr));
+
+        const size_t vpit = 1;
+        const Scalar vxx = Scalar(0.5) * rij.x * f.x;
+        const Scalar vxy = Scalar(0.5) * rij.x * f.y;
+        const Scalar vxz = Scalar(0.5) * rij.x * f.z;
+        const Scalar vyy = Scalar(0.5) * rij.y * f.y;
+        const Scalar vyz = Scalar(0.5) * rij.y * f.z;
+        const Scalar vzz = Scalar(0.5) * rij.z * f.z;
+
+        atomicAdd(&virial[0 * vpit + i], vxx);
+        atomicAdd(&virial[0 * vpit + j], vxx);
+        atomicAdd(&virial[1 * vpit + i], vxy);
+        atomicAdd(&virial[1 * vpit + j], vxy);
+        atomicAdd(&virial[2 * vpit + i], vxz);
+        atomicAdd(&virial[2 * vpit + j], vxz);
+        atomicAdd(&virial[3 * vpit + i], vyy);
+        atomicAdd(&virial[3 * vpit + j], vyy);
+        atomicAdd(&virial[4 * vpit + i], vyz);
+        atomicAdd(&virial[4 * vpit + j], vyz);
+        atomicAdd(&virial[5 * vpit + i], vzz);
+        atomicAdd(&virial[5 * vpit + j], vzz);
+        }
+    }
+
+    } // namespace
 
 namespace hoomd
     {
@@ -328,29 +521,7 @@ void ESPForceComputeGPU::interpolateForces()
 /*! \brief Compute the influence function on GPU. */
 void ESPForceComputeGPU::computeInfluenceFunction()
     {
-    // TODO(ESP): The gpu_compute_influence_function kernel computes the
-    // Gaussian influence function using arggauss = 0.25*dot2/kappa^2.
-    // For ESP, this must be replaced by the PSWF Fourier transform:
-    //   pswf_hat(k*rc/sigma0) = prod_d sinc(k_d*h_d/2)^P * compact(k_d*h_d/2)
-    // Until the kernel is patched, the reciprocal-space forces use the
-    // Gaussian approximation and will exhibit O(exp(-kappa^2*rc^2)) error.
-    // See ESPForceCompute::computeInfluenceFunction() for the correct formula.
-    m_tuner_influence->begin();
-    kernel::gpu_compute_influence_function(m_mesh_points,
-                                           m_global_dim,
-                                           m_inf_f.data(),
-                                           m_k.data(),
-                                           m_pdata->getGlobalBox(),
-                                           m_local_fft,
-                                           make_uint3(0, 0, 0),
-                                           make_uint3(1, 1, 1),
-                                           Scalar(0.0),
-                                           m_kappa,
-                                           m_alpha,
-                                           m_gf_b.data(),
-                                           m_order,
-                                           m_tuner_influence->getParam()[0]);
-    m_tuner_influence->end();
+    computeInfluenceFunctionGPU();
     }
 
 /*! \brief Compute reciprocal-space potential energy. */
@@ -362,174 +533,105 @@ Scalar ESPForceComputeGPU::computePE()
 /*! \brief Correct excluded-pair forces on GPU. */
 void ESPForceComputeGPU::fixExclusions()
     {
-    ESPForceCompute::fixExclusions();
-    // TODO(ESP): gpu_fix_exclusions uses erfc(kappa*r)/r from Gaussian splitting.
-    // For ESP, the exclusion correction must subtract the PSWF-derived L(r) from
-    // m_pswf_table_gpu instead of erfc(kappa*r)/r. This causes a systematic error
-    // proportional to |L_ewald(r) - L_esp(r)| for excluded pairs.
-    // Fix: add a new gpu_fix_exclusions_pswf kernel that reads m_pswf_table_gpu.
+    fixExclusionsGPU();
+    }
+
+/*! \brief Build the GPU influence function from the PSWF table. */
+void ESPForceComputeGPU::computeInfluenceFunctionGPU()
+    {
+    launchInfluenceFunctionKernel();
+    }
+
+void ESPForceComputeGPU::launchInfluenceFunctionKernel()
+    {
+    m_exec_conf->setDevice();
+
+    ArrayHandle<Scalar> d_inf_f(m_inf_f, access_location::device, access_mode::overwrite);
+    ArrayHandle<Scalar3> d_k(m_k, access_location::device, access_mode::overwrite);
+    ArrayHandle<Scalar> d_gf_b(m_gf_b, access_location::device, access_mode::read);
+    ArrayHandle<Scalar> d_denom(m_sum_partial, access_location::device, access_mode::overwrite);
+
+    const uint3 dim = m_mesh_points;
+    const unsigned int n = dim.x * dim.y * dim.z;
+    const unsigned int block_size = 256;
+    const unsigned int grid_size = (n + block_size - 1) / block_size;
+
+    launchGFDenominatorKernel();
+    gpu_build_influence_kernel<<<grid_size, block_size>>>(dim,
+                                                           m_pdata->getBox().getL().x,
+                                                           m_pdata->getBox().getL().y,
+                                                           m_pdata->getBox().getL().z,
+                                                           m_kappa,
+                                                           m_alpha,
+                                                           d_denom.data,
+                                                           d_inf_f.data,
+                                                           d_k.data);
+    if (m_exec_conf->isCUDAErrorCheckingEnabled())
+        CHECK_CUDA_ERROR();
+    }
+
+void ESPForceComputeGPU::launchGFDenominatorKernel()
+    {
+    m_exec_conf->setDevice();
+
+    ArrayHandle<Scalar> d_gf_b(m_gf_b, access_location::device, access_mode::read);
+    ArrayHandle<Scalar> d_denom(m_sum_partial, access_location::device, access_mode::overwrite);
+
+    const uint3 dim = m_mesh_points;
+    const unsigned int n = dim.x * dim.y * dim.z;
+    const unsigned int block_size = 256;
+    const unsigned int grid_size = (n + block_size - 1) / block_size;
+
+    gpu_build_gf_denom_kernel<<<grid_size, block_size>>>(dim,
+                                                          m_pdata->getBox().getL().x,
+                                                          m_pdata->getBox().getL().y,
+                                                          m_pdata->getBox().getL().z,
+                                                          m_rcut,
+                                                          d_gf_b.data,
+                                                          d_denom.data);
+    if (m_exec_conf->isCUDAErrorCheckingEnabled())
+        CHECK_CUDA_ERROR();
+    }
+
+/*! \brief Apply excluded-pair corrections on the GPU. */
+void ESPForceComputeGPU::fixExclusionsGPU()
+    {
+    m_exec_conf->setDevice();
+
+    if (!m_nlist->getExclusionsSet())
+        return;
+
+    ArrayHandle<Scalar4> d_pos(m_pdata->getPositions(), access_location::device, access_mode::read);
+    ArrayHandle<Scalar> d_chg(m_pdata->getCharges(), access_location::device, access_mode::read);
+    ArrayHandle<Scalar4> d_force(m_force, access_location::device, access_mode::readwrite);
+    ArrayHandle<Scalar> d_virial(m_virial, access_location::device, access_mode::readwrite);
+    ArrayHandle<unsigned int> d_nex(m_nlist->getNExArray(), access_location::device, access_mode::read);
+    ArrayHandle<unsigned int> d_exlist(m_nlist->getExListArray(), access_location::device, access_mode::read);
+    ArrayHandle<Scalar> d_table_flat(m_pswf_table_gpu, access_location::device, access_mode::read);
+
+    const unsigned int n = m_pdata->getN();
+    const unsigned int block_size = 128;
+    const unsigned int grid_size = (n + block_size - 1) / block_size;
+    const Index2D ex_idx = m_nlist->getExListIndexer();
+    const ESPTableEntry* table = reinterpret_cast<const ESPTableEntry*>(d_table_flat.data);
+
+    gpu_fix_exclusions_kernel<<<grid_size, block_size>>>(n,
+                                                         d_pos.data,
+                                                         d_chg.data,
+                                                         d_force.data,
+                                                         d_nex.data,
+                                                         d_exlist.data,
+                                                         ex_idx,
+                                                         table,
+                                                         m_n_table_segments,
+                                                         m_rcut,
+                                                         d_virial.data,
+                                                         m_pdata->getBox());
+    if (m_exec_conf->isCUDAErrorCheckingEnabled())
+        CHECK_CUDA_ERROR();
     }
 
     } // end namespace md
     } // end namespace hoomd
 
-#endif // ENABLE_HIP// Copyright (c) 2025 Shih-Lun Weng.
-// Part of RxMC, released under the BSD 3-Clause License.
-
-/*! \file ESPForceComputeGPU.cc
-    \brief Defines the custom GPU PPPM force compute.
-*/
-
-#include "HelpFunctions/ESPForceComputeGPU.h"
-
-#include <pybind11/pybind11.h>
-
-namespace hoomd
-    {
-namespace md
-    {
-
-#ifdef ENABLE_HIP
-ESPForceComputeGPU::ESPForceComputeGPU(std::shared_ptr<SystemDefinition> sysdef,
-                                                     std::shared_ptr<NeighborList> nlist,
-                                                     std::shared_ptr<ParticleGroup> group)
-    : PPPMForceComputeGPU(sysdef, nlist, group)
-    {
-    }
-
-uint3 ESPForceComputeGPU::computeGhostCellNumCustom() const
-    {
-    uint3 n_ghost_cells = make_uint3(0, 0, 0);
-#ifdef ENABLE_MPI
-    if (m_pdata->getDomainDecomposition())
-        {
-        Index3D di = m_pdata->getDomainDecomposition()->getDomainIndexer();
-        n_ghost_cells.x = (di.getW() > 1) ? m_radius : 0;
-        n_ghost_cells.y = (di.getH() > 1) ? m_radius : 0;
-        n_ghost_cells.z = (di.getD() > 1) ? m_radius : 0;
-        }
-#endif
-
-#ifdef ENABLE_MPI
-    if (m_sysdef->isDomainDecomposed())
-        {
-        Scalar r_buff = m_nlist->getRBuff() / 2.0;
-        const BoxDim& box = m_pdata->getBox();
-        Scalar3 cell_width = box.getNearestPlaneDistance()
-                             / make_scalar3(m_mesh_points.x, m_mesh_points.y, m_mesh_points.z);
-
-        if (n_ghost_cells.x)
-            n_ghost_cells.x += (unsigned int)(r_buff / cell_width.x) + 1;
-        if (n_ghost_cells.y)
-            n_ghost_cells.y += (unsigned int)(r_buff / cell_width.y) + 1;
-        if (n_ghost_cells.z)
-            n_ghost_cells.z += (unsigned int)(r_buff / cell_width.z) + 1;
-        }
-#endif
-    return n_ghost_cells;
-    }
-
-void ESPForceComputeGPU::refreshChargeDependentState()
-    {
-    m_q = getQSum();
-    m_q2 = getQ2Sum();
-
-    if (m_nlist->getFilterBody())
-        {
-        computeBodyCorrection();
-        }
-    }
-
-void ESPForceComputeGPU::computeForces(uint64_t timestep)
-    {
-    if (m_need_initialize || m_ptls_added_removed)
-        {
-        if (!m_params_set)
-            {
-            m_exec_conf->msg->error()
-                << "custom_pppm: parameters must be set before run()" << std::endl;
-            throw std::runtime_error("Error computing custom PPPM GPU forces");
-            }
-
-        setupMesh();
-        setupCoeffs();
-        computeInfluenceFunction();
-
-        if (m_nlist->getFilterBody())
-            {
-            m_exec_conf->msg->notice(2)
-                << "custom_pppm: calculating rigid body correction (N^2)" << std::endl;
-            computeBodyCorrection();
-            }
-
-        m_need_initialize = false;
-        m_ptls_added_removed = false;
-        }
-
-    bool ghost_cell_num_changed = false;
-    uint3 n_ghost_cells = computeGhostCellNumCustom();
-    if (m_n_ghost_cells.x != n_ghost_cells.x || m_n_ghost_cells.y != n_ghost_cells.y
-        || m_n_ghost_cells.z != n_ghost_cells.z)
-        ghost_cell_num_changed = true;
-
-    if (m_box_changed || ghost_cell_num_changed)
-        {
-        if (ghost_cell_num_changed)
-            {
-            setupMesh();
-            }
-        computeInfluenceFunction();
-        m_box_changed = false;
-        }
-
-    // Phase-3 optimization hook for RxMC:
-    // keep the PPPM charge cache consistent after charge/type moves, but avoid
-    // the global-particle-number path that reallocates mesh/FFT structures.
-    refreshChargeDependentState();
-
-    assignParticles();
-    updateMeshes();
-
-    PDataFlags flags = this->m_pdata->getFlags();
-    computePE();
-    interpolateForces();
-
-    if (flags[pdata_flag::pressure_tensor])
-        {
-        computeVirial();
-        }
-    else
-        {
-        for (unsigned int i = 0; i < 6; ++i)
-            {
-            m_external_virial[i] = Scalar(0.0);
-            }
-        }
-
-    if (m_nlist->getExclusionsSet())
-        {
-        m_nlist->compute(timestep);
-        fixExclusions();
-        }
-    }
-#endif
-
-namespace detail
-    {
-void export_ESPForceComputeGPU(pybind11::module& m)
-    {
-#ifdef ENABLE_HIP
-    pybind11::class_<ESPForceComputeGPU,
-                     PPPMForceComputeGPU,
-                     std::shared_ptr<ESPForceComputeGPU>>(m, "ESPForceComputeGPU")
-        .def(pybind11::init<std::shared_ptr<SystemDefinition>,
-                            std::shared_ptr<NeighborList>,
-                            std::shared_ptr<ParticleGroup>>());
-#else
-    (void)m;
-#endif
-    }
-    } // namespace detail
-
-    } // namespace md
-    } // namespace hoomd
+#endif // ENABLE_HIP

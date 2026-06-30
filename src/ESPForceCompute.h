@@ -61,6 +61,9 @@ namespace md
 /// Maximum allowed PSWF interpolation order.
 constexpr int ESP_MAX_ORDER = 12;
 
+/// Degree of the piecewise polynomial used for the PSWF table.
+constexpr unsigned int ESP_TABLE_POLY_DEGREE = 4u;
+
 /// Default number of piecewise-polynomial segments for the L(r) lookup table.
 constexpr unsigned int ESP_TABLE_SEGMENTS = 4096;
 
@@ -68,13 +71,11 @@ constexpr unsigned int ESP_TABLE_SEGMENTS = 4096;
 // ESPTableEntry — one segment of the L(r) / (-dL/dr) lookup table
 //
 // Memory layout (12 Scalars per segment, matches GPU flat upload):
-//   [0..3]   potential polynomial coefficients c0…c3
-//   [4]      potential polynomial coefficient  c4
-//   [5..8]   force     polynomial coefficients c0…c3
-//   [9]      force     polynomial coefficient  c4
+//   [0..4]   potential polynomial coefficients c0…c4
+//   [5..9]   force     polynomial coefficients c0…c4
 //   [10]     r_lo  (left endpoint of segment)
 //   [11]     dr_inv (= 1 / (r_hi - r_lo), segment reciprocal width)
-// Padding fields ensure the struct can be mapped directly onto a GPU buffer.
+// No padding is included so the struct maps directly to a flat Scalar array.
 // ============================================================================
 struct ESPTableEntry
     {
@@ -84,10 +85,8 @@ struct ESPTableEntry
     Scalar  force_coeff4;       // c4 of (-dL/dr) polynomial
     Scalar  r_lo;               // left edge of this segment [MD length units]
     Scalar  dr_inv;             // 1 / segment width
-    Scalar  _pad0;              // reserved
-    Scalar  _pad1;              // reserved
     };
-static_assert(sizeof(ESPTableEntry) == 14 * sizeof(Scalar),
+static_assert(sizeof(ESPTableEntry) == 12 * sizeof(Scalar),
               "ESPTableEntry size mismatch — update GPU upload code if changed.");
 
 // ============================================================================
@@ -148,6 +147,8 @@ class PYBIND11_EXPORT ESPForceCompute : public ForceCompute
     Scalar       getQSum()       const { return m_q;      }
     Scalar       getQ2Sum()      const { return m_q2;     }
     unsigned int getTableSize()  const { return m_n_table_segments; }
+    uintptr_t    getTablePtr()   const;
+    const std::vector<ESPTableEntry>& getTable() const { return m_pswf_table_cpu; }
 
     /// Force lazy re-initialisation on the next compute step.
     void invalidate() { m_need_initialize = true; }
@@ -260,6 +261,9 @@ class PYBIND11_EXPORT ESPForceCompute : public ForceCompute
     /// populating m_pswf_table_cpu and uploading to m_pswf_table_gpu.
     void buildPSWFTable();
 
+    /// Upload the CPU PSWF table into the flat GPU buffer.
+    void uploadPSWFTable();
+
     /// Return the PSWF self-energy constant I = ∫_0^1 ψ^2(u) du / r_c.
     Scalar computePSWFSelfEnergyConst() const;
 
@@ -302,6 +306,7 @@ class PYBIND11_EXPORT ESPForceCompute : public ForceCompute
     Scalar       m_rcut;    ///< Real-space cutoff
     int          m_order;   ///< PSWF interpolation order P
     Scalar       m_alpha;   ///< DH inverse screening length (0 = pure Coulomb)
+    Scalar       m_pswf_c;   ///< PSWF compact-support parameter c
     Scalar       m_q;       ///< Total charge (sum of q_i in group)
     Scalar       m_q2;      ///< Sum of q_i^2 (needed for self-energy)
 

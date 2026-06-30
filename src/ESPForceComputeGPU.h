@@ -14,6 +14,8 @@
 #include "ESPForceCompute.h"
 #include "hoomd/Autotuner.h"
 
+#include <sstream>
+
 namespace hoomd
     {
 namespace md
@@ -52,6 +54,20 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
 
     /*! \brief Correct excluded-pair forces on GPU. */
     void fixExclusions() override;
+
+    /*! \brief Build the GPU influence function from the PSWF table. */
+    void computeInfluenceFunctionGPU();
+
+    /*! \brief Launch the GPU kernel that builds the influence function. */
+    void launchInfluenceFunctionKernel();
+
+    /*! \brief Launch the GPU kernel that evaluates the PSWF denominator. */
+    void launchGFDenominatorKernel();
+
+    /*! \brief Apply excluded-pair corrections on the GPU. */
+    void fixExclusionsGPU();
+
+    void refreshChargeDependentState();
 
     inline void handleHIPFFTResult(hipfftResult result,
                                    const char* file,

@@ -4,11 +4,11 @@
 # hoomd_esp/esp.py
 #
 # Python-level wrappers for the ESP (Ewald Summation with Prolates) plugin.
-# Provides two public classes that mirror the HOOMD-blue PPPM API:
+# Provides two public classes for the ESP API:
 #
-#   hoomd_esp.esp.Coulomb   – long-range mesh contribution
+#   hoomd_esp.esp.Spectral  – long-range mesh contribution
 #                             (wraps ESPForceCompute via md.long_range)
-#   hoomd_esp.esp.Pair      – short-range real-space contribution
+#   hoomd_esp.esp.Local     – short-range real-space contribution
 #                             (wraps PotentialPair<EvaluatorPairPSWF>)
 #
 # Typical usage
@@ -21,7 +21,7 @@
 #
 #   nl = hoomd.md.nlist.Cell(buffer=0.4)
 #
-#   coulomb = esp.Coulomb(
+#   spectral = esp.Spectral(
 #       nlist=nl,
 #       default_r_cut=2.0,
 #       resolution=(64, 64, 64),
@@ -29,17 +29,17 @@
 #       kappa=1.0,
 #   )
 #
-#   pair = esp.Pair(
+#   local = esp.Local(
 #       nlist=nl,
 #       default_r_cut=2.0,
-#       coulomb=coulomb,
+#       spectral=spectral,
 #   )
-#   pair.params[("A", "A")] = {}   # all params come from Coulomb
-#   pair.r_cut[("A", "A")] = 2.0
+#   local.params[("A", "A")] = {}   # all params come from Spectral
+#   local.r_cut[("A", "A")] = 2.0
 #
 #   integrator = hoomd.md.Integrator(dt=0.002)
-#   integrator.forces.append(coulomb)
-#   integrator.forces.append(pair)
+#   integrator.forces.append(spectral)
+#   integrator.forces.append(local)
 #   sim.operations.integrator = integrator
 
 from __future__ import annotations
@@ -110,24 +110,23 @@ def _validate_resolution(res: Sequence[int]) -> Tuple[int, int, int]:
 
 
 def _estimate_kappa(r_cut: float, resolution: Tuple[int, int, int]) -> float:
-    """Rough default kappa = 3.2 / r_cut (PPPM-style rule of thumb)."""
+    """Rough default kappa = 3.2 / r_cut."""
     return 3.2 / r_cut
 
 
 # ===========================================================================
-# class Coulomb
+# class Spectral
 # ===========================================================================
 
-class Coulomb(hoomd.md.force.Force):
+class Spectral(hoomd.md.force.Force):
     """Long-range Coulomb force via the ESP mesh method.
 
-    Wraps ``ESPForceCompute`` (C++/CUDA) and exposes it with the same
-    keyword-argument interface as ``hoomd.md.long_range.pppm.Coulomb``.
+    Wraps ``ESPForceCompute`` (C++/CUDA) and exposes it with the ESP public API.
 
     The reciprocal-space contribution is computed on a regular mesh using a
     PSWF-based charge-assignment kernel of order *P* and the corresponding
     optimal influence function.  The short-range complement must be added via
-    :class:`Pair`.
+    :class:`Local`.
 
     Parameters
     ----------
@@ -177,14 +176,14 @@ class Coulomb(hoomd.md.force.Force):
     -------
     .. code-block:: python
 
-        coulomb = esp.Coulomb(
+        spectral = esp.Spectral(
             nlist=nl,
             default_r_cut=2.0,
             resolution=(64, 64, 64),
             order=6,
             kappa=1.0,
         )
-        integrator.forces.append(coulomb)
+        integrator.forces.append(spectral)
     """
 
     def __init__(
@@ -243,8 +242,8 @@ class Coulomb(hoomd.md.force.Force):
         # ── C++ object (created lazily in _attach) ─────────────────────────
         self._cpp_obj: Optional[_esp.ESPForceCompute] = None
 
-        # ── back-reference used by esp.Pair ───────────────────────────────
-        self._pair: Optional["Pair"] = None
+        # ── back-reference used by esp.Local ───────────────────────────────
+        self._pair: Optional["Local"] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -341,8 +340,8 @@ class Coulomb(hoomd.md.force.Force):
         """
         if self._cpp_obj is None:
             raise RuntimeError(
-                "ESP: set_params() called before the Simulation was attached.  "
-                "Pass initial values to the Coulomb constructor instead."
+                    "ESP: 'set_params()' called before the Simulation was attached.  "
+                "Pass initial values to the Spectral constructor instead."
             )
 
         if resolution is not None:
@@ -375,9 +374,9 @@ class Coulomb(hoomd.md.force.Force):
             self._alpha,
             self._n_table,
         )
-        # Propagate r_cut change to the associated Pair evaluator.
+        # Propagate r_cut change to the associated Local evaluator.
         if self._pair is not None:
-            self._pair._sync_params_from_coulomb()
+            self._pair._sync_params_from_spectral()
 
     def invalidate(self) -> None:
         """Force a full re-initialisation on the next compute step.
@@ -426,7 +425,7 @@ class Coulomb(hoomd.md.force.Force):
 
     def __repr__(self) -> str:
         return (
-            f"esp.Coulomb("
+            f"esp.Spectral("
             f"resolution={self._resolution}, "
             f"order={self._order}, "
             f"kappa={self._kappa:.4g}, "
@@ -439,24 +438,24 @@ class Coulomb(hoomd.md.force.Force):
 # class Pair
 # ===========================================================================
 
-class Pair(hoomd.md.pair.Pair):
+class Local(hoomd.md.pair.Pair):
     """Short-range real-space complement for the ESP mesh method.
 
     Wraps ``PotentialPair<EvaluatorPairPSWF>`` (C++) and must always be used
-    together with :class:`Coulomb`.  The pair evaluator reads the PSWF look-up
+    together with :class:`Spectral`.  The pair evaluator reads the PSWF look-up
     table pointer and the splitting parameters (κ, r_c, α) directly from the
-    associated :class:`Coulomb` object, so ``params`` dictionaries for each
+    associated :class:`Spectral` object, so ``params`` dictionaries for each
     type-pair contain **no user-settable fields**.
 
     Parameters
     ----------
     nlist:
-        Neighbor list (should be the same instance passed to :class:`Coulomb`).
+        Neighbor list (should be the same instance passed to :class:`Spectral`).
     default_r_cut:
         Default real-space cutoff for all type pairs.  Should match the value
-        given to :class:`Coulomb`.
-    coulomb:
-        The associated :class:`Coulomb` instance.  The pair evaluator will
+        given to :class:`Spectral`.
+    spectral:
+        The associated :class:`Spectral` instance.  The pair evaluator will
         pull κ, r_c, α, and the L(r) table pointer from this object.
     default_r_on:
         Inner smoothing radius (0 = sharp cutoff, which is correct for ESP
@@ -470,17 +469,17 @@ class Pair(hoomd.md.pair.Pair):
     -------
     .. code-block:: python
 
-        pair = esp.Pair(
+        local = esp.Local(
             nlist=nl,
             default_r_cut=2.0,
-            coulomb=coulomb,
+            spectral=spectral,
         )
         # Register every type-pair that carries a charge.
         for t1 in sim.state.particle_types:
             for t2 in sim.state.particle_types:
-                pair.params[(t1, t2)] = {}
-                pair.r_cut[(t1, t2)] = 2.0
-        integrator.forces.append(pair)
+                local.params[(t1, t2)] = {}
+                local.r_cut[(t1, t2)] = 2.0
+        integrator.forces.append(local)
     """
 
     # ------------------------------------------------------------------ #
@@ -493,14 +492,24 @@ class Pair(hoomd.md.pair.Pair):
         self,
         nlist: hoomd.md.nlist.NList,
         default_r_cut: float,
-        coulomb: Coulomb,
+        spectral: Optional[Spectral] = None,
+        coulomb: Optional[Spectral] = None,
         default_r_on: float = 0.0,
         mode: str = "none",
     ) -> None:
-        if not isinstance(coulomb, Coulomb):
+        if spectral is None and coulomb is not None:
+            warnings.warn(
+                "The 'coulomb' parameter is deprecated; use 'spectral' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            spectral = coulomb
+        if spectral is None:
+            raise ValueError("'spectral' (or deprecated 'coulomb') must be provided.")
+        if not isinstance(spectral, Spectral):
             raise TypeError(
-                "ESP: 'coulomb' must be an esp.Coulomb instance, "
-                f"got {type(coulomb).__name__!r}."
+                "ESP: 'spectral' must be an esp.Spectral instance, "
+                f"got {type(spectral).__name__!r}."
             )
         if mode not in ("none",):
             raise ValueError(
@@ -514,8 +523,8 @@ class Pair(hoomd.md.pair.Pair):
             mode=mode,
         )
 
-        self._coulomb = coulomb
-        coulomb._pair  = self  # cross-reference for runtime param sync
+        self._spectral = spectral
+        spectral._pair  = self  # cross-reference for runtime param sync
 
     # ------------------------------------------------------------------
     # params validation
@@ -526,13 +535,13 @@ class Pair(hoomd.md.pair.Pair):
         """ESP pair parameters carry no user-settable fields.
 
         Accepts an empty dict ``{}``; all physical parameters (κ, r_c, α,
-        table pointer) are sourced from the associated :class:`Coulomb`
+        table pointer) are sourced from the associated :class:`Spectral`
         object at attach time.
         """
         if params and set(params.keys()) - {"_reserved"}:
             warnings.warn(
-                "ESP: Pair.params accepts an empty dict {}; all ESP parameters "
-                "are read from the associated Coulomb object.  "
+                "ESP: Local.params accepts an empty dict {}; all ESP parameters "
+                "are read from the associated Spectral object.  "
                 f"Ignoring keys: {set(params.keys())!r}.",
                 stacklevel=3,
             )
@@ -545,36 +554,36 @@ class Pair(hoomd.md.pair.Pair):
     def _attach_hook(self) -> None:
         """Create PotentialPair<EvaluatorPairPSWF> and push table pointer."""
         super()._attach_hook()
-        self._sync_params_from_coulomb()
+        self._sync_params_from_spectral()
 
-    def _sync_params_from_coulomb(self) -> None:
-        """Push current ESP parameters from Coulomb into the C++ pair object.
+    def _sync_params_from_spectral(self) -> None:
+        """Push current ESP parameters from Spectral into the C++ pair object.
 
         This method is called:
-        - once at attach time (after both Coulomb and Pair are attached),
-        - whenever Coulomb.set_params() updates κ, r_c, α, or the table.
+        - once at attach time (after both Spectral and Local are attached),
+        - whenever Spectral.set_params() updates κ, r_c, α, or the table.
 
-        The table pointer is obtained from the Coulomb C++ object, which owns
+        The table pointer is obtained from the Spectral C++ object, which owns
         the ``m_pswf_table_gpu`` GPUArray.  Passing a ``uintptr_t`` avoids any
         Python-level ownership issue—the GPUArray outlives the pointer because
         both objects share the same Simulation lifetime.
         """
         if self._cpp_obj is None:
             return  # not yet attached; will be called again in _attach_hook
-        if self._coulomb._cpp_obj is None:
+        if self._spectral._cpp_obj is None:
             raise RuntimeError(
-                "ESP: Pair._sync_params_from_coulomb() called but the associated "
-                "Coulomb object is not attached.  Attach Coulomb before Pair."
+                "ESP: Local._sync_params_from_spectral() called but the associated "
+                "Spectral object is not attached.  Attach Spectral before Local."
             )
 
-        cpp_coulomb = self._coulomb._cpp_obj
-        kappa    = cpp_coulomb.getKappa()
-        r_cut    = cpp_coulomb.getRCut()
-        alpha    = cpp_coulomb.getAlpha()
-        n_segs   = cpp_coulomb.getTableSize()
+        cpp_spectral = self._spectral._cpp_obj
+        kappa    = cpp_spectral.getKappa()
+        r_cut    = cpp_spectral.getRCut()
+        alpha    = cpp_spectral.getAlpha()
+        n_segs   = cpp_spectral.getTableSize()
         # getTablePtr() returns a Python int holding the device pointer
         # (uintptr_t).  EvaluatorPairPSWF stores it as const Scalar*.
-        table_ptr = cpp_coulomb.getTablePtr()
+        table_ptr = cpp_spectral.getTablePtr()
 
         # Build param_type-compatible dict for each registered type pair.
         # The C++ evaluator reads: kappa, rcut, alpha, n_segs, table_ptr.
@@ -589,7 +598,7 @@ class Pair(hoomd.md.pair.Pair):
 
     def _detach_hook(self) -> None:
         super()._detach_hook()
-        self._coulomb._pair = None
+        self._spectral._pair = None
 
     # ------------------------------------------------------------------
     # Repr
@@ -597,9 +606,9 @@ class Pair(hoomd.md.pair.Pair):
 
     def __repr__(self) -> str:
         return (
-            f"esp.Pair(r_cut={self._coulomb._r_cut}, "
-            f"kappa={self._coulomb._kappa:.4g}, "
-            f"alpha={self._coulomb._alpha})"
+            f"esp.Local(r_cut={self._spectral._r_cut}, "
+            f"kappa={self._spectral._kappa:.4g}, "
+            f"alpha={self._spectral._alpha})"
         )
 
 
@@ -607,7 +616,7 @@ class Pair(hoomd.md.pair.Pair):
 # Convenience factory
 # ===========================================================================
 
-def make_esp(
+def make_esp_forces(
     nlist: hoomd.md.nlist.NList,
     r_cut: float,
     resolution: Sequence[int] = (32, 32, 32),
@@ -615,12 +624,11 @@ def make_esp(
     kappa: Optional[float] = None,
     alpha: float = 0.0,
     n_table: int = DEFAULT_TABLE_SEGMENTS,
-) -> Tuple[Coulomb, Pair]:
-    """Create a matched (Coulomb, Pair) pair ready to add to an integrator.
+) -> Tuple[Spectral, Local]:
+    """Create a coupled pair of ESP long-range (Spectral) and short-range (Local) forces.
 
-    This convenience function constructs both the long-range mesh force and the
-    short-range pair complement with consistent parameters and registers the
-    cross-reference between them.
+    This is the recommended entry point for ESP simulations.
+    Equivalent to the corresponding HOOMD-style helper for ESP forces.
 
     Parameters
     ----------
@@ -641,26 +649,26 @@ def make_esp(
 
     Returns
     -------
-    coulomb : Coulomb
+    spectral : esp.Spectral
         The long-range mesh force.
-    pair : Pair
+    local : esp.Local
         The short-range real-space complement.
 
     Example
     -------
     .. code-block:: python
 
-        coulomb, pair = esp.make_esp(
+        spectral, local = esp.make_esp_forces(
             nlist=nl, r_cut=2.0, resolution=(64, 64, 64), order=6, kappa=1.0
         )
-        integrator.forces.extend([coulomb, pair])
+        integrator.forces.extend([spectral, local])
         # Register type pairs:
         for t1 in sim.state.particle_types:
             for t2 in sim.state.particle_types:
-                pair.params[(t1, t2)] = {}
-                pair.r_cut[(t1, t2)]  = 2.0
+            local.params[(t1, t2)] = {}
+            local.r_cut[(t1, t2)] = 2.0
     """
-    coulomb = Coulomb(
+    spectral = Spectral(
         nlist=nlist,
         default_r_cut=r_cut,
         resolution=resolution,
@@ -669,8 +677,8 @@ def make_esp(
         alpha=alpha,
         n_table=n_table,
     )
-    pair = Pair(nlist=nlist, default_r_cut=r_cut, coulomb=coulomb)
-    return coulomb, pair
+    local = Local(nlist=nlist, default_r_cut=r_cut, spectral=spectral)
+    return spectral, local
 
 
 # ===========================================================================
@@ -678,10 +686,17 @@ def make_esp(
 # ===========================================================================
 
 __all__ = [
+    "Spectral",
+    "Local",
+    "make_esp_forces",
     "Coulomb",
     "Pair",
-    "make_esp",
     "MAX_ORDER",
     "DEFAULT_TABLE_SEGMENTS",
     "MIN_TABLE_SEGMENTS",
 ]
+
+
+# Backward-compatible aliases (deprecated)
+Coulomb = Spectral
+Pair = Local

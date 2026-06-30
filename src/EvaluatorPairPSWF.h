@@ -413,8 +413,6 @@ class EvaluatorPairPSWF
         const Scalar t      = (r - r_lo) * dr_inv;
 
         // ── Horner evaluation: L(r) ───────────────────────────────────────────
-        // L(r) ≈ c0 + t*(c1 + t*(c2 + t*(c3 + t*c4)))
-        // Coefficients: base[0] = c0 (constant term), base[4] = c4 (leading).
         Scalar L = base[4];
         L = base[3] + t * L;
         L = base[2] + t * L;
@@ -422,9 +420,6 @@ class EvaluatorPairPSWF
         L = base[0] + t * L;
 
         // ── Horner evaluation: -dL/dr ─────────────────────────────────────────
-        // Stored as force coefficients f0..f4 at base[5..9], same Horner form.
-        // Note: the table stores -dL/dr (positive for repulsive L), so no sign
-        // flip is needed before assigning to force_divr.
         Scalar dLdr_neg = base[9];
         dLdr_neg = base[8] + t * dLdr_neg;
         dLdr_neg = base[7] + t * dLdr_neg;
@@ -466,8 +461,8 @@ class EvaluatorPairPSWF
         // ── Force ─────────────────────────────────────────────────────────────
         // PotentialPair expects force_divr = F / r = -dV/dr / r.
         //   V = q_i * q_j * L(r)  =>  -dV/dr = q_i*q_j * (-dL/dr)
-        //   force_divr = q_i*q_j * (-dL/dr) / r = qiqj * dLdr_neg * rinv
-        force_divr = qiqj * dLdr_neg * rinv;
+        //   force_divr = q_i*q_j * (-dL/dr) = qiqj * dLdr_neg
+        force_divr = qiqj * dLdr_neg;
 
         return true;
         }

@@ -261,6 +261,7 @@ ESPForceCompute::ESPForceCompute(std::shared_ptr<SystemDefinition> sysdef,
       m_rcut(Scalar(0.0)),
       m_order(0),
       m_alpha(Scalar(0.0)),
+    m_pswf_c(Scalar(0.0)),
       m_q(Scalar(0.0)),
       m_q2(Scalar(0.0)),
       m_need_initialize(true),
@@ -637,6 +638,7 @@ void ESPForceCompute::setupCoeffs()
     compute_pswf_rho_coeff();
     compute_pswf_gf_denom();
     buildPSWFTable();
+    uploadPSWFTable();
     m_pswf_self_energy_const = computePSWFSelfEnergyConst();
     }
 
@@ -708,9 +710,7 @@ void ESPForceCompute::compute_pswf_gf_denom()
     {
     ArrayHandle<Scalar> h_gf_b(m_gf_b, access_location::host, access_mode::overwrite);
 
-    // β encodes both the order (stencil width) and the Debye-screening scale
-    const Scalar beta = Scalar(0.5) * Scalar(m_order)
-                      + std::max(Scalar(0.0), m_alpha * m_rcut);
+    const Scalar beta = m_pswf_c;
 
     for (int l = 0; l < m_order; ++l)
         {
@@ -1424,9 +1424,7 @@ void ESPForceCompute::computeBodyCorrection()
 
 // ----------------------------------------------------------------------------
 // evalPSWFKernel(x)
-//   Returns χ_α(x) ≡ (1-x^2)^P · exp_approx(β(1-x^2))  at x ∈ [0, 1].
-//   The exponential is approximated by its degree-2 Taylor series, which
-//   matches the analytic form used in the paper up to the accuracy of P≤8.
+//   Returns χ_α(x) ≡ (1-x^2)^P · exp(β(1-x^2))  at x ∈ [0, 1].
 // ----------------------------------------------------------------------------
 Scalar ESPForceCompute::evalPSWFKernel(Scalar x) const
     {
@@ -1434,12 +1432,9 @@ Scalar ESPForceCompute::evalPSWFKernel(Scalar x) const
     if (x <  Scalar(0.0)) x = Scalar(0.0);
 
     const Scalar s    = Scalar(1.0) - x * x;
-    const Scalar beta = Scalar(0.5) * Scalar(m_order)
-                      + std::max(Scalar(0.0), m_kappa * m_rcut);
+    const Scalar beta = m_pswf_c;
     const Scalar bs   = beta * s;
-    // exp(β s) ≈ 1 + β s + (β s)^2 / 2
-    const Scalar poly = Scalar(1.0) + bs + Scalar(0.5) * bs * bs;
-    return std::pow(s, Scalar(m_order)) * poly;
+    return std::pow(s, Scalar(m_order)) * std::exp(bs);
     }
 
 // ----------------------------------------------------------------------------
@@ -1520,12 +1515,14 @@ void ESPForceCompute::buildPSWFTable()
         e.force_coeff4     = fc[4];
         e.r_lo             = r0;
         e.dr_inv           = Scalar(1.0) / std::max(r1 - r0, Scalar(1.0e-20));
-        e._pad0            = Scalar(0.0);
-        e._pad1            = Scalar(0.0);
         m_pswf_table_cpu[seg] = e;
         }
 
-    // Upload flat Scalar layout to GPU array (12 Scalars per segment)
+    uploadPSWFTable();
+    }
+
+void ESPForceCompute::uploadPSWFTable()
+    {
     ArrayHandle<Scalar> h_gpu(m_pswf_table_gpu,
                               access_location::host, access_mode::overwrite);
     for (unsigned int seg = 0; seg < m_n_table_segments; ++seg)
@@ -1612,7 +1609,8 @@ void export_ESPForceCompute(pybind11::module& m)
         .def("getAlpha",      &ESPForceCompute::getAlpha)
         .def("getQSum",       &ESPForceCompute::getQSum)
         .def("getQ2Sum",      &ESPForceCompute::getQ2Sum)
-        .def("getTableSize",  &ESPForceCompute::getTableSize);
+        .def("getTableSize",  &ESPForceCompute::getTableSize)
+        .def("getTablePtr",   &ESPForceCompute::getTablePtr);
     }
 
 } // namespace md
