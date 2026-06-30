@@ -117,4 +117,3 @@ class PYBIND11_EXPORT ESPForceComputeGPU : public ESPForceCompute
     } // namespace md
     } // namespace hoomd
 
-#endif // ENABLE_HIP
