@@ -69,7 +69,7 @@ endif()
 # Locate HOOMD-blue via its exported CMake config
 # (installed as <prefix>/lib/cmake/hoomd/hoomd-config.cmake)
 # ---------------------------------------------------------------------------
-find_package(HOOMD 4.0 REQUIRED CONFIG
+find_package(HOOMD REQUIRED CONFIG
     HINTS
         "${HOOMD_ROOT}/lib/cmake/hoomd"
         "${HOOMD_ROOT}/lib64/cmake/hoomd"
@@ -186,14 +186,12 @@ target_include_directories(_esp
         # Plugin headers live in src/
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
 
-        # HOOMD public headers (exported by hoomd CMake targets)
-        # hoomd::hoomd exports HOOMD_INCLUDE_DIR via target properties;
-        # we pull them through the target link below, but also add explicitly
-        # for IDE navigation.
-        $<TARGET_PROPERTY:hoomd::hoomd,INTERFACE_INCLUDE_DIRECTORIES>
+        # HOOMD public headers (exported by the HOOMD CMake package)
+        # The installed package uses the HOOMD:: namespace.
+        $<$<TARGET_EXISTS:HOOMD::hoomd>:$<TARGET_PROPERTY:HOOMD::hoomd,INTERFACE_INCLUDE_DIRECTORIES>>
 
         # HOOMD MD component headers (NeighborList.h, CommunicatorGrid.h …)
-        $<TARGET_PROPERTY:hoomd::md,INTERFACE_INCLUDE_DIRECTORIES>
+        $<$<TARGET_EXISTS:HOOMD::md>:$<TARGET_PROPERTY:HOOMD::md,INTERFACE_INCLUDE_DIRECTORIES>>
 
         # MPI headers (if enabled)
         $<$<BOOL:${HOOMD_MPI}>:${MPI_CXX_INCLUDE_PATH}>
@@ -204,8 +202,8 @@ target_include_directories(_esp
 # ---------------------------------------------------------------------------
 target_link_libraries(_esp
     PRIVATE
-        hoomd::hoomd          # core: ForceCompute, GPUArray, BoxDim …
-        hoomd::md             # md: NeighborList, CommunicatorGrid, PPPM …
+        HOOMD::hoomd          # core: ForceCompute, GPUArray, BoxDim …
+        HOOMD::md             # md: NeighborList, CommunicatorGrid, PPPM …
         pybind11::module      # pybind11 module support
         $<$<BOOL:${HOOMD_MPI}>:MPI::MPI_CXX>
         $<$<BOOL:${ESP_ENABLE_GPU}>:CUDA::cufft>
