@@ -13,6 +13,20 @@ set(_${COMPONENT_NAME}_sources
     ESPForceCompute.cc
 )
 
+set(_${COMPONENT_NAME}_cu_sources
+    ESPForceComputeGPU.cu
+)
+
+set(_${COMPONENT_NAME}_headers
+    ESPForceCompute.h
+    EvaluatorPairPSWF.h
+)
+
+if(ENABLE_HIP)
+    list(APPEND _${COMPONENT_NAME}_sources ESPForceComputeGPU.cc)
+    list(APPEND _${COMPONENT_NAME}_headers ESPForceComputeGPU.h)
+endif()
+
 set(python_files
     __init__.py
     esp.py
@@ -22,7 +36,14 @@ set(python_files
 #########################
 ## Build the module
 
-hoomd_add_module(_${COMPONENT_NAME} SHARED ${_${COMPONENT_NAME}_sources} NO_EXTRAS)
+if(ENABLE_HIP)
+    hoomd_add_module(_${COMPONENT_NAME} SHARED
+        ${_${COMPONENT_NAME}_sources}
+        ${_${COMPONENT_NAME}_cu_sources}
+        NO_EXTRAS)
+else()
+    hoomd_add_module(_${COMPONENT_NAME} SHARED ${_${COMPONENT_NAME}_sources} NO_EXTRAS)
+endif()
 
 # alias into the HOOMD namespace so plugins and symlinked components both work
 add_library(HOOMD::_${COMPONENT_NAME} ALIAS _${COMPONENT_NAME})
@@ -37,6 +58,10 @@ target_link_libraries(_${COMPONENT_NAME} PUBLIC
     HOOMD::_md
     pybind11::module
     )
+
+if(ENABLE_HIP)
+    target_link_libraries(_${COMPONENT_NAME} PUBLIC HOOMD::_md_gpu)
+endif()
 
 set_target_properties(_${COMPONENT_NAME} PROPERTIES
     CXX_STANDARD 17

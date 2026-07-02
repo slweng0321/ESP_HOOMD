@@ -1,82 +1,100 @@
 # Copyright (c) 2024-2026 ESP Plugin Contributors.
 # Released under the BSD 3-Clause License.
-#
+
 # hoomd_esp/esp.py
 #
 # Python-level wrappers for the ESP (Ewald Summation with Prolates) plugin.
 # Provides two public classes for the ESP API:
 #
-#   hoomd_esp.esp.Spectral  – long-range mesh contribution
-#                             (wraps ESPForceCompute via md.long_range)
-#   hoomd_esp.esp.Local     – short-range real-space contribution
-#                             (wraps PotentialPair<EvaluatorPairPSWF>)
+#   hoomd_esp.esp.Spectral - long-range mesh contribution
+#     (wraps ESPForceCompute via md.long_range)
+#   hoomd_esp.esp.Local - short-range real-space contribution
+#     (wraps PotentialPair<EvaluatorPairPSWF>)
+#
+# Bug fix in this revision
+# --------------------------
+# Local._sync_params_from_spectral() previously pushed "n_segs" and
+# "table_ptr" into each type-pair's params dict, sourced from
+# Spectral._cpp_obj.getTableSize()/getTablePtr(). Those C++ accessors return
+# metadata about ESPForceCompute's CPU-side introspection table
+# (m_pswf_table_cpu), NOT a valid GPU device pointer -- EvaluatorPairPSWF
+# has been rewritten to read its screening-function tables directly from
+# the compile-time PSWF_Coeffs.h header instead, and its param_type no
+# longer has "n_segs"/"table_ptr" fields at all. Continuing to pass them
+# here would silently be ignored by the new param_type(dict) constructor,
+# but is removed entirely to avoid confusion and stale documentation.
+#
+# The synced params are now exactly: kappa, rcut, alpha, V_cut (the last
+# fixed at 0.0, since L(r) vanishes at r_cut by construction of the PSWF
+# splitting -- there is no cutoff-energy discontinuity to shift away).
 #
 # Typical usage
 # -------------
-#   import hoomd
-#   import hoomd_esp.esp as esp
+# import hoomd
+# import hoomd_esp.esp as esp
 #
-#   sim = hoomd.Simulation(device=hoomd.device.GPU())
-#   sim.create_state_from_gsd("init.gsd")
+# sim = hoomd.Simulation(device=hoomd.device.GPU())
+# sim.create_state_from_gsd("init.gsd")
 #
-#   nl = hoomd.md.nlist.Cell(buffer=0.4)
+# nl = hoomd.md.nlist.Cell(buffer=0.4)
 #
-#   spectral = esp.Spectral(
-#       nlist=nl,
-#       default_r_cut=2.0,
-#       resolution=(64, 64, 64),
-#       order=6,
-#       kappa=1.0,
-#   )
+# spectral = esp.Spectral(
+#     nlist=nl,
+#     default_r_cut=2.0,
+#     resolution=(64, 64, 64),
+#     order=6,
+#     kappa=1.0,
+# )
 #
-#   local = esp.Local(
-#       nlist=nl,
-#       default_r_cut=2.0,
-#       spectral=spectral,
-#   )
-#   local.params[("A", "A")] = {}   # all params come from Spectral
-#   local.r_cut[("A", "A")] = 2.0
+# local = esp.Local(
+#     nlist=nl,
+#     default_r_cut=2.0,
+#     spectral=spectral,
+# )
+# local.params[("A", "A")] = {}  # all params come from Spectral
+# local.r_cut[("A", "A")] = 2.0
 #
-#   integrator = hoomd.md.Integrator(dt=0.002)
-#   integrator.forces.append(spectral)
-#   integrator.forces.append(local)
-#   sim.operations.integrator = integrator
+# integrator = hoomd.md.Integrator(dt=0.002)
+# integrator.forces.append(spectral)
+# integrator.forces.append(local)
+# sim.operations.integrator = integrator
 
 from __future__ import annotations
 
-import math
 import warnings
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple
 
 import hoomd
 import hoomd.md
 
 # ---------------------------------------------------------------------------
-# Try to import the compiled C++ extension.  If it is not found we raise a
+# Try to import the compiled C++ extension. If it is not found we raise a
 # clear ImportError rather than letting users see a cryptic AttributeError.
 # ---------------------------------------------------------------------------
 try:
     from . import _esp  # compiled pybind11 extension (esp_plugin.so)
 except ImportError as _exc:
     raise ImportError(
-        "hoomd_esp: compiled extension '_esp' not found.  "
+        "hoomd_esp: compiled extension '_esp' not found. "
         "Please build the plugin with 'cmake --build' before importing."
     ) from _exc
-
 
 # ---------------------------------------------------------------------------
 # Module-level constants (kept in sync with ESPForceCompute.h)
 # ---------------------------------------------------------------------------
 
-#: Maximum supported PSWF interpolation order P.  Mirrors ESP_MAX_ORDER.
+#: Maximum supported PSWF interpolation order P. Mirrors ESP_MAX_ORDER.
 MAX_ORDER: int = 8
 
-#: Default number of look-up table segments for L(r).  Mirrors ESP_TABLE_SEGMENTS.
+#: Default number of look-up table segments for the CPU introspection table
+#: (ESPForceCompute.table property). Mirrors ESPForceCompute.h's
+#: ESP_TABLE_SEGMENTS default, which itself mirrors PSWF_Coeffs.h's
+#: PSWF_N_SEGS. NOT used by EvaluatorPairPSWF any more (that evaluator
+#: reads PSWF_Coeffs.h directly, with no runtime segment count).
 DEFAULT_TABLE_SEGMENTS: int = 512
 
-#: Minimum table segments allowed.
+#: Minimum table segments allowed for the introspection table.
 MIN_TABLE_SEGMENTS: int = 16
-
 
 # ===========================================================================
 # Utility helpers
@@ -101,9 +119,7 @@ def _validate_resolution(res: Sequence[int]) -> Tuple[int, int, int]:
     """Validate and unpack a (Nx, Ny, Nz) mesh-resolution tuple."""
     res = tuple(int(v) for v in res)
     if len(res) != 3:
-        raise ValueError(
-            f"ESP: 'resolution' must be a 3-tuple (Nx, Ny, Nz), got length {len(res)}."
-        )
+        raise ValueError(f"ESP: 'resolution' must be a 3-tuple (Nx, Ny, Nz), got length {len(res)}.")
     for i, (v, label) in enumerate(zip(res, ("Nx", "Ny", "Nz"))):
         _check_positive_int(v, f"resolution[{i}] ({label})")
     return res  # type: ignore[return-value]
@@ -125,7 +141,7 @@ class Spectral(hoomd.md.force.Force):
 
     The reciprocal-space contribution is computed on a regular mesh using a
     PSWF-based charge-assignment kernel of order *P* and the corresponding
-    optimal influence function.  The short-range complement must be added via
+    optimal influence function. The short-range complement must be added via
     :class:`Local`.
 
     Parameters
@@ -133,26 +149,29 @@ class Spectral(hoomd.md.force.Force):
     nlist:
         Neighbor list used for the real-space exclusion correction.
     default_r_cut:
-        Real-space cutoff radius *r_c* (in simulation length units).
+        Real-space cutoff radius *r_c* (in simulation length units). Must
+        equal the PSWF_RCUT baked into PSWF_Coeffs.h at build time.
     resolution:
-        Global mesh size ``(Nx, Ny, Nz)``.  Each dimension should be even;
+        Global mesh size ``(Nx, Ny, Nz)``. Each dimension should be even;
         powers of two are required when running with MPI domain decomposition.
     order:
-        PSWF interpolation order *P* (integer, 1 ≤ P ≤ 8).
+        PSWF interpolation order *P* (integer, 1 <= P <= 8).
         Higher values give smaller mesh error at the cost of a wider stencil.
-        Recommended: 6 for ~10⁻⁸ accuracy.
+        Recommended: 6 for ~10^-8 accuracy.
     kappa:
-        Ewald splitting parameter κ [1/length].  If ``None``, a
+        Ewald splitting parameter kappa [1/length]. If ``None``, a
         heuristic default of ``3.2 / r_cut`` is used.
     alpha:
-        Debye–Hückel screening constant [1/length].  Set to 0 (default)
+        Debye-Hueckel screening constant [1/length]. Set to 0 (default)
         for pure Coulomb; set > 0 for Yukawa-screened electrostatics.
     n_table:
-        Number of piecewise-polynomial segments used to tabulate *L(r)*.
-        Increase beyond 512 only for extremely high-accuracy requirements.
+        Number of piecewise-polynomial segments used for the CPU-side
+        introspection table (``Spectral.table`` / plotting). Does NOT
+        affect the runtime-critical GPU/CPU evaluators, which always read
+        the fixed-resolution compile-time PSWF_Coeffs.h table.
     nlist_buffer:
         Extra skin distance added to the neighbor-list cutoff to account for
-        particle motion between list rebuilds.  Defaults to 10 % of r_cut.
+        particle motion between list rebuilds. Defaults to 10% of r_cut.
 
     Attributes
     ----------
@@ -168,9 +187,9 @@ class Spectral(hoomd.md.force.Force):
     alpha : float
         Debye screening parameter (0 = pure Coulomb).
     q_sum : float
-        Total system charge Σ qᵢ (available after the first time step).
+        Total system charge Sum q_i (available after the first time step).
     q2_sum : float
-        Σ qᵢ² (available after the first time step).
+        Sum q_i^2 (available after the first time step).
 
     Example
     -------
@@ -199,20 +218,18 @@ class Spectral(hoomd.md.force.Force):
     ) -> None:
         super().__init__()
 
-        # ── validate inputs ────────────────────────────────────────────────
+        # -- validate inputs --------------------------------------------------
         _check_positive_float(default_r_cut, "default_r_cut")
         res = _validate_resolution(resolution)
 
         if not (isinstance(order, int) and 1 <= order <= MAX_ORDER):
-            raise ValueError(
-                f"ESP: 'order' must be an integer in [1, {MAX_ORDER}], got {order!r}."
-            )
+            raise ValueError(f"ESP: 'order' must be an integer in [1, {MAX_ORDER}], got {order!r}.")
 
         if kappa is None:
             kappa = _estimate_kappa(default_r_cut, res)
             warnings.warn(
                 f"ESP: 'kappa' not specified; using heuristic kappa = {kappa:.4f} "
-                f"(= 3.2 / r_cut).  For production runs, tune kappa explicitly.",
+                f"(= 3.2 / r_cut). For production runs, tune kappa explicitly.",
                 stacklevel=2,
             )
         else:
@@ -221,28 +238,25 @@ class Spectral(hoomd.md.force.Force):
         _check_nonneg_float(alpha, "alpha")
 
         if not (isinstance(n_table, int) and n_table >= MIN_TABLE_SEGMENTS):
-            raise ValueError(
-                f"ESP: 'n_table' must be an integer >= {MIN_TABLE_SEGMENTS}, "
-                f"got {n_table!r}."
-            )
+            raise ValueError(f"ESP: 'n_table' must be an integer >= {MIN_TABLE_SEGMENTS}, got {n_table!r}.")
 
-        # ── store parameters ───────────────────────────────────────────────
-        self._nlist        = nlist
-        self._r_cut        = float(default_r_cut)
-        self._resolution   = res
-        self._order        = int(order)
-        self._kappa        = float(kappa)
-        self._alpha        = float(alpha)
-        self._n_table      = int(n_table)
+        # -- store parameters ---------------------------------------------------
+        self._nlist = nlist
+        self._r_cut = float(default_r_cut)
+        self._resolution = res
+        self._order = int(order)
+        self._kappa = float(kappa)
+        self._alpha = float(alpha)
+        self._n_table = int(n_table)
 
         if nlist_buffer is None:
             nlist_buffer = 0.1 * self._r_cut
         self._nlist_buffer = float(nlist_buffer)
 
-        # ── C++ object (created lazily in _attach) ─────────────────────────
+        # -- C++ object (created lazily in _attach) ------------------------------
         self._cpp_obj: Optional[_esp.ESPForceCompute] = None
 
-        # ── back-reference used by esp.Local ───────────────────────────────
+        # -- back-reference used by esp.Local -------------------------------------
         self._pair: Optional["Local"] = None
 
     # ------------------------------------------------------------------
@@ -251,7 +265,7 @@ class Spectral(hoomd.md.force.Force):
 
     @property
     def kappa(self) -> float:
-        """Ewald splitting parameter κ [1/length]."""
+        """Ewald splitting parameter kappa [1/length]."""
         if self._cpp_obj is not None:
             return self._cpp_obj.getKappa()
         return self._kappa
@@ -279,21 +293,21 @@ class Spectral(hoomd.md.force.Force):
 
     @property
     def alpha(self) -> float:
-        """Debye screening parameter α (0 = pure Coulomb)."""
+        """Debye screening parameter alpha (0 = pure Coulomb)."""
         if self._cpp_obj is not None:
             return self._cpp_obj.getAlpha()
         return self._alpha
 
     @property
     def q_sum(self) -> float:
-        """Total system charge Σ qᵢ (updated each time step)."""
+        """Total system charge Sum q_i (updated each time step)."""
         if self._cpp_obj is None:
             raise RuntimeError("ESP: q_sum not available before simulation attachment.")
         return self._cpp_obj.getQSum()
 
     @property
     def q2_sum(self) -> float:
-        """Sum Σ qᵢ² (updated each time step)."""
+        """Sum q_i^2 (updated each time step)."""
         if self._cpp_obj is None:
             raise RuntimeError("ESP: q2_sum not available before simulation attachment.")
         return self._cpp_obj.getQ2Sum()
@@ -315,7 +329,7 @@ class Spectral(hoomd.md.force.Force):
         """Update ESP parameters at runtime and trigger re-initialisation.
 
         All keyword arguments are optional; only the supplied values are
-        updated.  The change takes effect on the *next* call to
+        updated. The change takes effect on the *next* call to
         ``computeForces()``.
 
         Parameters
@@ -331,7 +345,7 @@ class Spectral(hoomd.md.force.Force):
         alpha:
             New Debye screening constant.
         n_table:
-            New look-up table size.
+            New CPU introspection look-up table size.
 
         Raises
         ------
@@ -340,7 +354,7 @@ class Spectral(hoomd.md.force.Force):
         """
         if self._cpp_obj is None:
             raise RuntimeError(
-                    "ESP: 'set_params()' called before the Simulation was attached.  "
+                "ESP: 'set_params()' called before the Simulation was attached. "
                 "Pass initial values to the Spectral constructor instead."
             )
 
@@ -374,7 +388,8 @@ class Spectral(hoomd.md.force.Force):
             self._alpha,
             self._n_table,
         )
-        # Propagate r_cut change to the associated Local evaluator.
+
+        # Propagate r_cut/kappa/alpha changes to the associated Local evaluator.
         if self._pair is not None:
             self._pair._sync_params_from_spectral()
 
@@ -416,7 +431,7 @@ class Spectral(hoomd.md.force.Force):
 
     def _detach_hook(self) -> None:
         """Release the C++ object when detached from a Simulation."""
-        self._cpp_obj  = None
+        self._cpp_obj = None
         self._cpp_force = None  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
@@ -435,15 +450,17 @@ class Spectral(hoomd.md.force.Force):
 
 
 # ===========================================================================
-# class Pair
+# class Local
 # ===========================================================================
 
 class Local(hoomd.md.pair.Pair):
     """Short-range real-space complement for the ESP mesh method.
 
     Wraps ``PotentialPair<EvaluatorPairPSWF>`` (C++) and must always be used
-    together with :class:`Spectral`.  The pair evaluator reads the PSWF look-up
-    table pointer and the splitting parameters (κ, r_c, α) directly from the
+    together with :class:`Spectral`. The pair evaluator reads S(r)/S'(r)
+    directly from the compile-time PSWF_Coeffs.h table baked into the C++
+    extension at build time -- it does NOT read a runtime table pointer.
+    Only the physical scalars (kappa, r_c, alpha, V_cut) are synced from the
     associated :class:`Spectral` object, so ``params`` dictionaries for each
     type-pair contain **no user-settable fields**.
 
@@ -452,18 +469,19 @@ class Local(hoomd.md.pair.Pair):
     nlist:
         Neighbor list (should be the same instance passed to :class:`Spectral`).
     default_r_cut:
-        Default real-space cutoff for all type pairs.  Should match the value
-        given to :class:`Spectral`.
+        Default real-space cutoff for all type pairs. Must match the value
+        given to :class:`Spectral` (and the PSWF_RCUT compiled into the
+        extension).
     spectral:
-        The associated :class:`Spectral` instance.  The pair evaluator will
-        pull κ, r_c, α, and the L(r) table pointer from this object.
+        The associated :class:`Spectral` instance. The pair evaluator will
+        pull kappa, r_c, and alpha from this object.
     default_r_on:
         Inner smoothing radius (0 = sharp cutoff, which is correct for ESP
         since L(r) already goes smoothly to zero at r_c).
     mode:
         Shifting mode: ``"none"`` (default, correct for ESP) or ``"shift"``.
         ESP's L(r) is constructed to vanish at r_c, so no additional shifting
-        is needed.
+        is needed; V_cut is always synced as 0.0.
 
     Example
     -------
@@ -482,10 +500,6 @@ class Local(hoomd.md.pair.Pair):
         integrator.forces.append(local)
     """
 
-    # ------------------------------------------------------------------ #
-    # EvaluatorPairPSWF requires charge data from the ParticleData.       #
-    # We declare this at class level so HOOMD knows to pass charges.       #
-    # ------------------------------------------------------------------ #
     _accepted_modes = ("none",)  # ESP pair does not need XPLOR smoothing
 
     def __init__(
@@ -507,14 +521,10 @@ class Local(hoomd.md.pair.Pair):
         if spectral is None:
             raise ValueError("'spectral' (or deprecated 'coulomb') must be provided.")
         if not isinstance(spectral, Spectral):
-            raise TypeError(
-                "ESP: 'spectral' must be an esp.Spectral instance, "
-                f"got {type(spectral).__name__!r}."
-            )
+            raise TypeError(f"ESP: 'spectral' must be an esp.Spectral instance, got {type(spectral).__name__!r}.")
+
         if mode not in ("none",):
-            raise ValueError(
-                "ESP: Pair mode must be 'none' for ESP (L(r) already vanishes at r_c)."
-            )
+            raise ValueError("ESP: Pair mode must be 'none' for ESP (L(r) already vanishes at r_c).")
 
         super().__init__(
             nlist=nlist,
@@ -524,7 +534,7 @@ class Local(hoomd.md.pair.Pair):
         )
 
         self._spectral = spectral
-        spectral._pair  = self  # cross-reference for runtime param sync
+        spectral._pair = self  # cross-reference for runtime param sync
 
     # ------------------------------------------------------------------
     # params validation
@@ -534,14 +544,14 @@ class Local(hoomd.md.pair.Pair):
     def _validate_params(params: dict) -> dict:
         """ESP pair parameters carry no user-settable fields.
 
-        Accepts an empty dict ``{}``; all physical parameters (κ, r_c, α,
-        table pointer) are sourced from the associated :class:`Spectral`
-        object at attach time.
+        Accepts an empty dict ``{}``; all physical parameters (kappa, r_c,
+        alpha) are sourced from the associated :class:`Spectral` object at
+        attach time.
         """
         if params and set(params.keys()) - {"_reserved"}:
             warnings.warn(
                 "ESP: Local.params accepts an empty dict {}; all ESP parameters "
-                "are read from the associated Spectral object.  "
+                "are read from the associated Spectral object. "
                 f"Ignoring keys: {set(params.keys())!r}.",
                 stacklevel=3,
             )
@@ -552,48 +562,51 @@ class Local(hoomd.md.pair.Pair):
     # ------------------------------------------------------------------
 
     def _attach_hook(self) -> None:
-        """Create PotentialPair<EvaluatorPairPSWF> and push table pointer."""
+        """Create PotentialPair<EvaluatorPairPSWF> and push scalar params."""
         super()._attach_hook()
         self._sync_params_from_spectral()
 
     def _sync_params_from_spectral(self) -> None:
-        """Push current ESP parameters from Spectral into the C++ pair object.
+        """Push current ESP scalar parameters from Spectral into the C++ pair object.
 
         This method is called:
-        - once at attach time (after both Spectral and Local are attached),
-        - whenever Spectral.set_params() updates κ, r_c, α, or the table.
+          - once at attach time (after both Spectral and Local are attached),
+          - whenever Spectral.set_params() updates kappa, r_cut, or alpha.
 
-        The table pointer is obtained from the Spectral C++ object, which owns
-        the ``m_pswf_table_gpu`` GPUArray.  Passing a ``uintptr_t`` avoids any
-        Python-level ownership issue—the GPUArray outlives the pointer because
-        both objects share the same Simulation lifetime.
+        BUG FIX (this revision): previously also read
+        ``cpp_spectral.getTableSize()`` and ``cpp_spectral.getTablePtr()``
+        and pushed them as "n_segs"/"table_ptr" into each type-pair's
+        params. EvaluatorPairPSWF::param_type no longer has those fields --
+        it reads its S(r)/S'(r) tables directly from the compile-time
+        PSWF_Coeffs.h header instead of any runtime pointer. Only the four
+        physical scalars below are synced now.
         """
         if self._cpp_obj is None:
             return  # not yet attached; will be called again in _attach_hook
         if self._spectral._cpp_obj is None:
             raise RuntimeError(
                 "ESP: Local._sync_params_from_spectral() called but the associated "
-                "Spectral object is not attached.  Attach Spectral before Local."
+                "Spectral object is not attached. Attach Spectral before Local."
             )
 
         cpp_spectral = self._spectral._cpp_obj
-        kappa    = cpp_spectral.getKappa()
-        r_cut    = cpp_spectral.getRCut()
-        alpha    = cpp_spectral.getAlpha()
-        n_segs   = cpp_spectral.getTableSize()
-        # getTablePtr() returns a Python int holding the device pointer
-        # (uintptr_t).  EvaluatorPairPSWF stores it as const Scalar*.
-        table_ptr = cpp_spectral.getTablePtr()
+        kappa = cpp_spectral.getKappa()
+        r_cut = cpp_spectral.getRCut()
+        alpha = cpp_spectral.getAlpha()
+
+        # L(r) vanishes at r_cut by construction of the PSWF splitting
+        # kernel (S(1) == 0 in PSWF_Coeffs.h's normalisation), so no
+        # energy-shift constant is needed; V_cut is always 0.0.
+        v_cut = 0.0
 
         # Build param_type-compatible dict for each registered type pair.
-        # The C++ evaluator reads: kappa, rcut, alpha, n_segs, table_ptr.
+        # The C++ evaluator reads: kappa, rcut, alpha, V_cut.
         for key in list(self.params.keys()):
             self.params[key] = dict(
-                kappa     = kappa,
-                rcut      = r_cut,
-                alpha     = alpha,
-                n_segs    = n_segs,
-                table_ptr = table_ptr,
+                kappa=kappa,
+                rcut=r_cut,
+                alpha=alpha,
+                V_cut=v_cut,
             )
 
     def _detach_hook(self) -> None:
@@ -628,7 +641,6 @@ def make_esp_forces(
     """Create a coupled pair of ESP long-range (Spectral) and short-range (Local) forces.
 
     This is the recommended entry point for ESP simulations.
-    Equivalent to the corresponding HOOMD-style helper for ESP forces.
 
     Parameters
     ----------
@@ -641,11 +653,11 @@ def make_esp_forces(
     order:
         PSWF interpolation order P.
     kappa:
-        Splitting parameter κ.  Heuristic default if ``None``.
+        Splitting parameter kappa. Heuristic default if ``None``.
     alpha:
         Debye screening constant (0 = pure Coulomb).
     n_table:
-        Look-up table size.
+        CPU introspection look-up table size.
 
     Returns
     -------
@@ -665,8 +677,8 @@ def make_esp_forces(
         # Register type pairs:
         for t1 in sim.state.particle_types:
             for t2 in sim.state.particle_types:
-            local.params[(t1, t2)] = {}
-            local.r_cut[(t1, t2)] = 2.0
+                local.params[(t1, t2)] = {}
+                local.r_cut[(t1, t2)] = 2.0
     """
     spectral = Spectral(
         nlist=nlist,
@@ -682,8 +694,11 @@ def make_esp_forces(
 
 
 # ===========================================================================
-# __all__
+# __all__ / backward-compatible aliases
 # ===========================================================================
+
+Coulomb = Spectral
+Pair = Local
 
 __all__ = [
     "Spectral",
@@ -695,8 +710,3 @@ __all__ = [
     "DEFAULT_TABLE_SEGMENTS",
     "MIN_TABLE_SEGMENTS",
 ]
-
-
-# Backward-compatible aliases (deprecated)
-Coulomb = Spectral
-Pair = Local

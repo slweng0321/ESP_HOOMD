@@ -25,8 +25,8 @@ endif()
 ################################
 ## Dependencies
 
-find_package(HOOMD REQUIRED CONFIG)
-find_package(pybind11 REQUIRED CONFIG)
+find_package(HOOMD REQUIRED)
+find_package(pybind11 REQUIRED)
 
 message(STATUS "Found HOOMD ${HOOMD_VERSION}: ${HOOMD_INSTALL_PREFIX}/${PYTHON_SITE_INSTALL_DIR}")
 
@@ -34,9 +34,7 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX ${HOOMD_INSTALL_PREFIX} CACHE PATH "Installation prefix" FORCE)
 endif()
 
-if(DEFINED HOOMD_INCLUDE_DIR)
-    include_directories(${HOOMD_INCLUDE_DIR})
-endif()
+include_directories(${HOOMD_INSTALL_PREFIX}/include)
 
 ################################
 ## Compiler settings
